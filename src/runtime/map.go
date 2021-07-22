@@ -63,13 +63,19 @@ import (
 const (
 	// Maximum number of key/elem pairs a bucket can hold.
 	bucketCntBits = 3
+	// 一个桶中最多能装载的键值对（key-value）的个数为 8
+	// 1 << 3 = 1 * 2^3 = 8
 	bucketCnt     = 1 << bucketCntBits
 
+	// 触发扩容的装载因子为 13 / 2 = 6.5
+	//
 	// Maximum average load of a bucket that triggers growth is 6.5.
 	// Represent as loadFactorNum/loadFactorDen, to allow integer math.
 	loadFactorNum = 13
 	loadFactorDen = 2
 
+	//
+	// 键和值超过 128 个字节，就会被转换为指针
 	// Maximum key or elem size to keep inline (instead of mallocing per element).
 	// Must fit in a uint8.
 	// Fast versions cannot handle big elems - the cutoff size for
@@ -111,6 +117,8 @@ func isEmpty(x uint8) bool {
 	return x <= emptyOne
 }
 
+// 参考自：https://mp.weixin.qq.com/s/q3qyc5uf3IMVt4KQD12IKQ
+//
 // map 的创建函数：
 //				makemap
 // map 的查找函数：
@@ -145,13 +153,15 @@ type hmap struct {
 	buckets unsafe.Pointer // array of 2^B Buckets. may be nil if count==0.
 
 	// oldbuckets 用于在扩容阶段保存旧桶的位置
+	// 如果 oldbuckets == nil，则代表以及迁移完成
+	// 判断函数为 growing()
 	oldbuckets unsafe.Pointer // previous bucket array of half the size, non-nil only when growing
 
 	// 记录渐进式扩容阶段下一个要迁移的旧桶编号
-	// TODO 何为渐进式？
+	// 何为渐进式？
 	// 如果触发扩容，此时不会一次性把 kv 全部从旧桶迁移到新桶，而是当执行插入（包括修改）、删除操作时，
 	// 对一部分 kv 进行迁移，这样就可以把迁移的时间分摊到多次 map 操作中，防止瞬间性能抖动
-	// 迁移是否完成的判断依据是 oldbuckets 字段是否为空
+	// ps: 每次最多只会搬迁 2 个 bucket，迁移是否完成的判断依据是 oldbuckets 字段是否为空
 	nevacuate  uintptr        // progress counter for evacuation (buckets less than this have been evacuated)
 
 	// 指向一个 mapextra，mapextra 里面记录的是溢出桶的相关信息
@@ -754,7 +764,10 @@ again:
 	// bucketMask 返回值是 2 的 B 次方减 1
 	// 因此，通过 hash 值与 bucketMask 返回值做按位与操作，返回的在 buckets 数组中的第几号桶
 	bucket := hash & bucketMask(h.B)
-	// 如果 map 正在搬迁（即 h.oldbuckets != nil）中,则先进行搬迁工作
+
+	// 如果 map 正在搬迁（即 h.oldbuckets != nil）中,则同时进行搬迁工作
+	// 这里涉及到了渐进式扩容这一概念，即扩容不是一次性迁移所有键，而是在其他
+	// 操作中进行小部分迁移
 	if h.growing() {
 		growWork(t, h, bucket)
 	}
@@ -810,9 +823,10 @@ bucketloop:
 		b = ovf
 	}
 
-	// 在已有的桶和溢出桶中都未找到合适的cell供key写入，那么有可能会触发以下两种情况
+	// 在已有的桶和溢出桶中都未找到合适的 cell 供 key 写入，那么有可能会触发以下两种情况
 	// 情况一：
-	// 判断当前 map 的装载因子是否达到设定的 6.5 阈值，或者当前map的溢出桶数量是否过多。如果存在这两种情况之一，则进行扩容操作。
+	// 判断当前 map 的装载因子是否达到设定的 6.5 阈值，或者当前 map 的溢出桶数量是否过多。
+	// 如果存在这两种情况之一，则进行扩容操作。
 	// hashGrow() 实际并未完成扩容，对哈希表数据的搬迁（复制）操作是通过 growWork() 来完成的。
 	// 重新跳入 again 逻辑，在进行完 growWork() 操作后，再次遍历新的桶。
 
@@ -1206,15 +1220,43 @@ func mapclear(t *maptype, h *hmap) {
 // hashGrow() 函数实际上并没有真正地“搬迁”，它只是分配好了新的 buckets，并将老的 buckets
 // 挂到了 hmap.oldbuckets 字段上。
 func hashGrow(t *maptype, h *hmap) {
+	// 扩容策略分以下两种情况：
+	// 1. 判断已经达到装载因子的临界点，即元素个数 >= 桶（bucket）总数 * 6.5，
+	//    这时候说明大部分的桶可能都快满了（即平均每个桶存储的键值对达到6.5个），
+	//    如果插入新元素，有大概率需要挂在溢出桶（overflow bucket）上，判断
+	//    函数为 overLoadFactor
+	//
+	// 2. 判断溢出桶是否太多，当桶总数 < 2 ^ 15 时，如果溢出桶总数 >= 桶总数，
+	//	  则认为溢出桶过多。当桶总数 >= 2 ^ 15 时，直接与 2 ^ 15 比较，当溢出
+	//	  桶总数 >= 2 ^ 15 时，即认为溢出桶太多了，判断函数：tooManyOverflowBuckets
+	//
+	//	  在某些场景下，比如不断的增删，这样会造成 overflow 的 bucket 数量增多，但负载因子
+	//	  又不高，未达不到第 1 点的临界值，就不能触发扩容来缓解这种情况。这样会造成桶的使用率不高，
+	//	  值存储得比较稀疏，查找插入效率会变得非常低，因此有了第 2 点判断指标。这就像是一座空城，房
+	//	  子很多，但是住户很少，都分散了，找起人来很困难
+	//
+	// 两种情况官方采用了不同的解决方案
+	//
+	// 针对 1，将 B + 1（桶数量为 2 ^ B，B+1 则代表翻倍），新建一个 buckets 数组，
+	// 新的 buckets 大小是原来的 2 倍，然后旧 buckets 数据搬迁到新的 buckets。该方法我们称之为增量扩容。
+	//
+	// 针对 2，并不扩大容量，buckets 数量维持不变，重新做一遍类似增量扩容的搬迁动作，把松散的键值对
+	// 重新排列一次，把在 overflow bucket 中的 key 移动到 bucket 中来以使 bucket 的使用率
+	// 更高，进而保证更快的存取。该方法我们称之为等量扩容。
+
 	// If we've hit the load factor, get bigger.
 	// Otherwise, there are too many overflow buckets,
 	// so keep the same number of buckets and "grow" laterally.
 	bigger := uint8(1)
+
+	// 如果没有达到负载因子临界点，则设置为等量扩容
 	if !overLoadFactor(h.count+1, h.B) {
-		bigger = 0
+		bigger = 0	// bigger 设置为 0
 		h.flags |= sameSizeGrow
 	}
+	// 记录老 buckets 的位置
 	oldbuckets := h.buckets
+	// 分配一个新的数组用来存放新桶
 	newbuckets, nextOverflow := makeBucketArray(t, h.B+bigger, nil)
 
 	flags := h.flags &^ (iterator | oldIterator)
@@ -1296,13 +1338,14 @@ func (h *hmap) oldbucketmask() uintptr {
 // mapassign() 和 mapdelete() 函数中。也就是插入（包括修改）、删除 key 的时候，都
 // 会尝试进行搬迁 buckets 的工作。它们会先检查 oldbuckets 是否搬迁完毕（检查 oldbuckets
 // 是否为 nil），再决定是否进行搬迁工作。
+// growWork 会搬迁 0~2 个桶
 func growWork(t *maptype, h *hmap, bucket uintptr) {
 	// make sure we evacuate the oldbucket corresponding
 	// to the bucket we're about to use
 	evacuate(t, h, bucket&h.oldbucketmask())
 
 	// evacuate one more oldbucket to make progress on growing
-	if h.growing() {
+	if h.growing() {	// 再多搬迁一个桶
 		evacuate(t, h, h.nevacuate)
 	}
 }

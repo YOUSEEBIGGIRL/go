@@ -3286,9 +3286,11 @@ func injectglist(glist *gList) {
 	}
 }
 
+// 一轮调度
 // One round of scheduler: find a runnable goroutine and execute it.
 // Never returns.
 func schedule() {
+	// 获取当前正在执行的 goroutine 的信息
 	_g_ := getg()
 
 	if _g_.m.locks != 0 {
