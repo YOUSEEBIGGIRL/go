@@ -46,6 +46,7 @@ func (pq *PriorityQueue) Pop() interface{} {
 	n := len(old)
 	item := old[n-1]
 	old[n-1] = nil  // avoid memory leak
+	// 将 index 置为 -1 是为了标识该数据已经出了优先级队列了
 	item.index = -1 // for safety
 	*pq = old[0 : n-1]
 	return item

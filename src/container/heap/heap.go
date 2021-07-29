@@ -31,7 +31,11 @@ import "sort"
 // use heap.Push and heap.Pop.
 type Interface interface {
 	sort.Interface
+
+	// Push 添加 x 到末尾
 	Push(x interface{}) // add x as element Len()
+
+	// Pop 弹出末尾元素并返回
 	Pop() interface{}   // remove and return element Len() - 1.
 }
 
@@ -63,7 +67,6 @@ func Push(h Interface, x interface{}) {
 func Pop(h Interface) interface{} {
 	n := h.Len() - 1
 	// 堆顶是最小（或最大）元素，将其交换到末尾，pop 会移除该元素
-	//（pop 是自己实现的，一般都是移除末尾元素）
 	h.Swap(0, n)
 	// FIXME down 的作用不确定，以下为猜测
 	// down 会将第二小（或大）的元素移动到堆顶，便于下次操作
@@ -187,16 +190,16 @@ func up(h Interface, j int) {
 func down(h Interface, i0, n int) bool {
 	i := i0
 	for {
-		j1 := 2*i + 1          // i 的左子节点
+		j1 := 2*i + 1          // j1 是 i 的左子节点
 		// j1 > n 代表子节点不存在
 		// j1 == n 代表子节点是堆中最后一个节点，down 操作会忽略最后一个元素
 		if j1 >= n || j1 < 0 { // j1 < 0 after int overflow
 			break
 		}
-		// j 默认为左子节点
+		// j 用来保存子节点中较小（大）的那个，默认为左子节点
 		j := j1 // left child
 
-		// j2 := j1 + 1 => i 的右子节点
+		// j2 := j1 + 1，这表示 j2 是 i 的右子节点
 		// 这里是 j2 < n 而不是 j2 <= n，因为 down 操作会忽略最后一个元素
 		// 如果是最小堆，则选出 j1（左子节点）和 j2（右子节点）中较小的那个
 		// 如果是最大堆，则选出 j1（左子节点）和 j2（右子节点）中较大的那个
