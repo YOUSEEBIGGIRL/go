@@ -249,11 +249,13 @@ var goroutines int32
 // propagateCancel arranges for child to be canceled when parent is.
 func propagateCancel(parent Context, child canceler) {
 	done := parent.Done()
+	// parent 未被取消
 	if done == nil {
 		return // parent is never canceled
 	}
 
 	select {
+	// parent 被取消
 	case <-done:
 		// parent is already canceled
 		child.cancel(false, parent.Err())
@@ -340,7 +342,7 @@ func init() {
 // A cancelCtx can be canceled. When canceled, it also cancels any children
 // that implement canceler.
 type cancelCtx struct {
-	Context
+	Context	// 实现 Context 接口
 
 	mu       sync.Mutex            // protects following fields
 	done     atomic.Value          // of chan struct{}, created lazily, closed by first cancel call
@@ -410,10 +412,13 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 	} else {
 		close(d)
 	}
+
+	// 对所有 child 调用 cancel
 	for child := range c.children {
 		// NOTE: acquiring the child's lock while holding parent's lock.
 		child.cancel(false, err)
 	}
+	// child 置为 nil
 	c.children = nil
 	c.mu.Unlock()
 

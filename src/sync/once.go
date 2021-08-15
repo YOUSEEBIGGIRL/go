@@ -54,6 +54,7 @@ func (o *Once) Do(f func()) {
 	// This is why the slow path falls back to a mutex, and why
 	// the atomic.StoreUint32 must be delayed until after f returns.
 
+	// done 为 0 代表 f() 还没有执行完成，需要进入到 doSlow() 中
 	if atomic.LoadUint32(&o.done) == 0 {
 		// Outlined slow-path to allow inlining of the fast-path.
 		o.doSlow(f)
@@ -61,9 +62,15 @@ func (o *Once) Do(f func()) {
 }
 
 func (o *Once) doSlow(f func()) {
+	// 第一个进入该方法的 goroutine 会进行加锁操作，之后进入的 goroutine 都会被阻塞，
+	// 这样就可以保证让所有 goroutine 等待 f() 完成后再继续
 	o.m.Lock()
+	// 第一个 goroutine 执行完毕后释放锁，此时 f() 已经完成，并且 done 已经改为 1，
+	// 之前被 lock 阻塞的 goroutine 全部恢复，但是执行到 o.done == 0 时不满足条件，
+	// 所以执行结束
 	defer o.m.Unlock()
 	if o.done == 0 {
+		// 直到 f() 执行完毕后，才会将 done 置为 1
 		defer atomic.StoreUint32(&o.done, 1)
 		f()
 	}
