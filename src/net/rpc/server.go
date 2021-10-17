@@ -150,14 +150,25 @@ const (
 // because Typeof takes an empty interface value. This is annoying.
 var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 
+// 用来保存方法的一些信息
+// 一个合法的，可用于 rpc 调用的方法，如下所示：
+// type P struct { X, Y int64 }
+// type R struct {Res int64}
+// func (a *A) add(arg *P, reply *R) error { R.Res = P.X + P.Y }
+// 其中 arg 用来传递参数，reply用来保存结果
+// ArgType 保存参数的类型，比如在上面的例子中，ArgType 是 *P
+// ReplyType 同理
 type methodType struct {
+	// 加锁来保护 numCalls 字段
 	sync.Mutex // protects counters
 	method     reflect.Method
-	ArgType    reflect.Type
-	ReplyType  reflect.Type
-	numCalls   uint
+	ArgType    reflect.Type // 用来传递参数的类型
+	ReplyType  reflect.Type // 用来保存调用结果的类型
+	numCalls   uint         // 保存该方法的调用次数
 }
 
+// 代表一个服务，每调用 Server.Register 注册一个对象时，相应的也创建了一个 service
+//
 type service struct {
 	name   string                 // name of service
 	rcvr   reflect.Value          // receiver of methods for the service
@@ -186,6 +197,7 @@ type Response struct {
 
 // Server represents an RPC Server.
 type Server struct {
+	// 该 Server 下的所有 service
 	serviceMap sync.Map   // map[string]*service
 	reqLock    sync.Mutex // protects freeReq
 	freeReq    *Request
@@ -235,6 +247,7 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 	s := new(service)
 	s.typ = reflect.TypeOf(rcvr)
 	s.rcvr = reflect.ValueOf(rcvr)
+	// 结构体的名字
 	sname := reflect.Indirect(s.rcvr).Type().Name()
 	if useName {
 		sname = name
@@ -252,13 +265,30 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 	s.name = sname
 
 	// Install the methods
+	// 获得该结构体下的所有方法，用一个 map 保存，map 的 key 是方法名，value 是 methodType
+	// type methodType struct {
+	//    sync.Mutex
+	//    method    reflect.Method
+	//    ArgType   reflect.Type
+	//    ReplyType reflect.Type
+	//    numCalls  uint
+	// }
 	s.method = suitableMethods(s.typ, true)
 
+	// 如果该结构体没有方法
 	if len(s.method) == 0 {
 		str := ""
 
 		// To help the user, see if a pointer receiver would work.
+		// 可能方法的接受者是指针类型，用指针类型获取方法
 		method := suitableMethods(reflect.PtrTo(s.typ), false)
+		// 如果指针下有方法，说明用户调用 register 时传错了对象，比如：
+		// type A struct {}
+		// func (a *A) fn() {}
+		//
+		// register(A) => 传入的不是指针，所以获取不到该对象的方法，会抛出下面的错误
+		// (hint: pass a pointer to value of that type)，提示你应该传入一个指针类型的 struct
+		// register(new(A)) => 此时正确
 		if len(method) != 0 {
 			str = "rpc.Register: type " + sname + " has no exported methods of suitable type (hint: pass a pointer to value of that type)"
 		} else {
@@ -267,7 +297,8 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 		log.Print(str)
 		return errors.New(str)
 	}
-
+	// 使用 sync.map 来确保并发安全
+	// 这里不允许重复注册
 	if _, dup := server.serviceMap.LoadOrStore(sname, s); dup {
 		return errors.New("rpc: service already defined: " + sname)
 	}
@@ -276,17 +307,22 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 
 // suitableMethods returns suitable Rpc methods of typ, it will report
 // error using log if reportErr is true.
+// map 的 key 是方法名，value 是 methodType，里面保存了该方法的一些信息
 func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 	methods := make(map[string]*methodType)
+	// 遍历获取 typ 下的所有方法
 	for m := 0; m < typ.NumMethod(); m++ {
 		method := typ.Method(m)
-		mtype := method.Type
-		mname := method.Name
+		mtype := method.Type // 方法的类型
+		mname := method.Name // 方法名
 		// Method must be exported.
-		if !method.IsExported() {
+		if !method.IsExported() { // 确认方法是否是 public
 			continue
 		}
+		// ------------------ 下面是对方法规范性的检查 ------------------
+
 		// Method needs three ins: receiver, *args, *reply.
+		// 确认方法是否拥有三个参数，三个参数如上所示，分别是 receiver, *args, *reply
 		if mtype.NumIn() != 3 {
 			if reportErr {
 				log.Printf("rpc.Register: method %q has %d input parameters; needs exactly three\n", mname, mtype.NumIn())
@@ -294,7 +330,9 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			continue
 		}
 		// First arg need not be a pointer.
+		// 第一个参数是 "对象.方法"，这是一个字符串类型，要求不能传入指针
 		argType := mtype.In(1)
+		// 如果该参数不可导出，或者不是基本类型
 		if !isExportedOrBuiltinType(argType) {
 			if reportErr {
 				log.Printf("rpc.Register: argument type of method %q is not exported: %q\n", mname, argType)
@@ -302,6 +340,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			continue
 		}
 		// Second arg must be a pointer.
+		// 第二个参数是调用方法的参数，必须是指针类型
 		replyType := mtype.In(2)
 		if replyType.Kind() != reflect.Ptr {
 			if reportErr {
@@ -310,6 +349,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			continue
 		}
 		// Reply type must be exported.
+		// 第三个参数是用来保存调用结果的，必须可导出
 		if !isExportedOrBuiltinType(replyType) {
 			if reportErr {
 				log.Printf("rpc.Register: reply type of method %q is not exported: %q\n", mname, replyType)
@@ -317,6 +357,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			continue
 		}
 		// Method needs one out.
+		// 方法需要有一个返回值
 		if mtype.NumOut() != 1 {
 			if reportErr {
 				log.Printf("rpc.Register: method %q has %d output parameters; needs exactly one\n", mname, mtype.NumOut())
@@ -324,12 +365,14 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 			continue
 		}
 		// The return type of the method must be error.
+		// 并且这个返回值必须是 error 类型
 		if returnType := mtype.Out(0); returnType != typeOfError {
 			if reportErr {
 				log.Printf("rpc.Register: return type of method %q is %q, must be error\n", mname, returnType)
 			}
 			continue
 		}
+		// 检查无误后，加入到 map 中
 		methods[mname] = &methodType{method: method, ArgType: argType, ReplyType: replyType}
 	}
 	return methods
@@ -340,6 +383,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 // contains an error when it is used.
 var invalidRequest = struct{}{}
 
+// 发送响应信息到 conn 中
 func (server *Server) sendResponse(sending *sync.Mutex, req *Request, reply interface{}, codec ServerCodec, errmsg string) {
 	resp := server.getResponse()
 	// Encode the response header
@@ -350,6 +394,7 @@ func (server *Server) sendResponse(sending *sync.Mutex, req *Request, reply inte
 	}
 	resp.Seq = req.Seq
 	sending.Lock()
+	// 通过 codec 编码器，将数据（resp 和 reply）编码，并写入到 conn 中
 	err := codec.WriteResponse(resp, reply)
 	if debugLog && err != nil {
 		log.Println("rpc: writing response:", err)
@@ -365,17 +410,20 @@ func (m *methodType) NumCalls() (n uint) {
 	return n
 }
 
+// 通过反射来执行方法
 func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec) {
 	if wg != nil {
 		defer wg.Done()
 	}
 	mtype.Lock()
-	mtype.numCalls++
+	mtype.numCalls++ // 调用次数 + 1
 	mtype.Unlock()
 	function := mtype.method.Func
 	// Invoke the method, providing a new value for the reply.
+	// 调用方法
 	returnValues := function.Call([]reflect.Value{s.rcvr, argv, replyv})
 	// The return value for the method is an error.
+	// 规定方法必须有一个返回值 error，这里取得这个返回值，并检查是否有错误
 	errInter := returnValues[0].Interface()
 	errmsg := ""
 	if errInter != nil {
@@ -385,6 +433,7 @@ func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, 
 	server.freeRequest(req)
 }
 
+// 默认使用了 gob 作为编解码器
 type gobServerCodec struct {
 	rwc    io.ReadWriteCloser
 	dec    *gob.Decoder
@@ -393,14 +442,28 @@ type gobServerCodec struct {
 	closed bool
 }
 
+func NewGobServerCodec(conn io.ReadWriteCloser) *gobServerCodec {
+	buf := bufio.NewWriter(conn)
+	srv := &gobServerCodec{
+		rwc:    conn,
+		dec:    gob.NewDecoder(conn),
+		enc:    gob.NewEncoder(buf),
+		encBuf: buf,
+	}
+	return srv
+}
+
+// 从 conn 中读取数据，并且通过 gob 解码为一个 Request 对象，保存到 r 中
 func (c *gobServerCodec) ReadRequestHeader(r *Request) error {
 	return c.dec.Decode(r)
 }
 
+// 从 conn 中读取数据，并且通过 gob 解码到 body 中
 func (c *gobServerCodec) ReadRequestBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
 
+// 将 r 和 body 通过 gob 编码，并写入到 conn 中
 func (c *gobServerCodec) WriteResponse(r *Response, body interface{}) (err error) {
 	if err = c.enc.Encode(r); err != nil {
 		if c.encBuf.Flush() == nil {
