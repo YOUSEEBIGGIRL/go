@@ -212,6 +212,7 @@ func (t *transferWriter) probeRequestBody() {
 			rres.b = buf[0]
 		}
 		t.ByteReadCh <- rres
+		close(t.ByteReadCh)
 	}(t.Body)
 	timer := time.NewTimer(200 * time.Millisecond)
 	select {
@@ -1029,7 +1030,7 @@ func (b *body) registerOnHitEOF(fn func()) {
 	b.onHitEOF = fn
 }
 
-// bodyLocked is a io.Reader reading from a *body when its mutex is
+// bodyLocked is an io.Reader reading from a *body when its mutex is
 // already held.
 type bodyLocked struct {
 	b *body
@@ -1071,6 +1072,9 @@ func (fr finishAsyncByteRead) Read(p []byte) (n int, err error) {
 	n, err = rres.n, rres.err
 	if n == 1 {
 		p[0] = rres.b
+	}
+	if err == nil {
+		err = io.EOF
 	}
 	return
 }

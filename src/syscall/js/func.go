@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build js,wasm
+//go:build js && wasm
 
 package js
 
@@ -13,8 +13,6 @@ var (
 	funcs             = make(map[uint32]func(Value, []Value) interface{})
 	nextFuncID uint32 = 1
 )
-
-var _ Wrapper = Func{} // Func must implement Wrapper
 
 // Func is a wrapped Go function to be called by JavaScript.
 type Func struct {

@@ -85,6 +85,7 @@
 package runtime
 
 import (
+	"internal/goarch"
 	"runtime/internal/atomic"
 	"runtime/internal/sys"
 	"unsafe"
@@ -212,6 +213,8 @@ func cgocallbackg(fn, frame unsafe.Pointer, ctxt uintptr) {
 	// a different M. The call to unlockOSThread is in unwindm.
 	lockOSThread()
 
+	checkm := gp.m
+
 	// Save current syscall parameters, so m.syscall can be
 	// used again if callback decide to make syscall.
 	syscall := gp.m.syscall
@@ -227,15 +230,20 @@ func cgocallbackg(fn, frame unsafe.Pointer, ctxt uintptr) {
 
 	osPreemptExtExit(gp.m)
 
-	cgocallbackg1(fn, frame, ctxt)
+	cgocallbackg1(fn, frame, ctxt) // will call unlockOSThread
 
 	// At this point unlockOSThread has been called.
 	// The following code must not change to a different m.
 	// This is enforced by checking incgo in the schedule function.
 
+	gp.m.incgo = true
+
+	if gp.m != checkm {
+		throw("m changed unexpectedly in cgocallbackg")
+	}
+
 	osPreemptExtEnter(gp.m)
 
-	gp.m.incgo = true
 	// going back to cgo call
 	reentersyscall(savedpc, uintptr(savedsp))
 
@@ -244,6 +252,11 @@ func cgocallbackg(fn, frame unsafe.Pointer, ctxt uintptr) {
 
 func cgocallbackg1(fn, frame unsafe.Pointer, ctxt uintptr) {
 	gp := getg()
+
+	// When we return, undo the call to lockOSThread in cgocallbackg.
+	// We must still stay on the same m.
+	defer unlockOSThread()
+
 	if gp.m.needextram || atomic.Load(&extraMWaiters) > 0 {
 		gp.m.needextram = false
 		systemstack(newextram)
@@ -276,6 +289,13 @@ func cgocallbackg1(fn, frame unsafe.Pointer, ctxt uintptr) {
 		// this call may be coming in before package initialization
 		// is complete. Wait until it is.
 		<-main_init_done
+	}
+
+	// Check whether the profiler needs to be turned on or off; this route to
+	// run Go code does not use runtime.execute, so bypasses the check there.
+	hz := sched.profilehz
+	if gp.m.profilehz != hz {
+		setThreadCPUProfiler(hz)
 	}
 
 	// Add entry to defer stack in case of panic.
@@ -323,10 +343,6 @@ func unwindm(restore *bool) {
 
 		releasem(mp)
 	}
-
-	// Undo the call to lockOSThread in cgocallbackg.
-	// We must still stay on the same m.
-	unlockOSThread()
 }
 
 // called from assembly
@@ -472,7 +488,7 @@ func cgoCheckArg(t *_type, p unsafe.Pointer, indir, top bool, msg string) {
 		if inheap(uintptr(unsafe.Pointer(it))) {
 			panic(errorString(msg))
 		}
-		p = *(*unsafe.Pointer)(add(p, sys.PtrSize))
+		p = *(*unsafe.Pointer)(add(p, goarch.PtrSize))
 		if !cgoIsGoPointer(p) {
 			return
 		}
@@ -552,7 +568,7 @@ func cgoCheckUnknownPointer(p unsafe.Pointer, msg string) (base, i uintptr) {
 		}
 		hbits := heapBitsForAddr(base)
 		n := span.elemsize
-		for i = uintptr(0); i < n; i += sys.PtrSize {
+		for i = uintptr(0); i < n; i += goarch.PtrSize {
 			if !hbits.morePointers() {
 				// No more possible pointers.
 				break

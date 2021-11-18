@@ -5,8 +5,9 @@
 package runtime
 
 import (
+	"internal/abi"
+	"internal/goarch"
 	"runtime/internal/atomic"
-	"runtime/internal/sys"
 	"unsafe"
 )
 
@@ -543,7 +544,7 @@ func initLongPathSupport() {
 }
 
 func osinit() {
-	asmstdcallAddr = unsafe.Pointer(funcPC(asmstdcall))
+	asmstdcallAddr = unsafe.Pointer(abi.FuncPCABI0(asmstdcall))
 
 	setBadSignalMsg()
 
@@ -906,7 +907,7 @@ func semacreate(mp *m) {
 func newosproc(mp *m) {
 	// We pass 0 for the stack size to use the default for this binary.
 	thandle := stdcall6(_CreateThread, 0, 0,
-		funcPC(tstart_stdcall), uintptr(unsafe.Pointer(mp)),
+		abi.FuncPCABI0(tstart_stdcall), uintptr(unsafe.Pointer(mp)),
 		0, 0)
 
 	if thandle == 0 {
@@ -1193,8 +1194,10 @@ func ctrlHandler(_type uint32) uintptr {
 	if sigsend(s) {
 		if s == _SIGTERM {
 			// Windows terminates the process after this handler returns.
-			// Block indefinitely to give signal handlers a chance to clean up.
-			stdcall1(_Sleep, uintptr(_INFINITE))
+			// Block indefinitely to give signal handlers a chance to clean up,
+			// but make sure to be properly parked first, so the rest of the
+			// program can continue executing.
+			block()
 		}
 		return 1
 	}
@@ -1385,14 +1388,14 @@ func preemptM(mp *m) {
 	if gp != nil && wantAsyncPreempt(gp) {
 		if ok, newpc := isAsyncSafePoint(gp, c.ip(), c.sp(), c.lr()); ok {
 			// Inject call to asyncPreempt
-			targetPC := funcPC(asyncPreempt)
+			targetPC := abi.FuncPCABI0(asyncPreempt)
 			switch GOARCH {
 			default:
 				throw("unsupported architecture")
 			case "386", "amd64":
 				// Make it look like the thread called targetPC.
 				sp := c.sp()
-				sp -= sys.PtrSize
+				sp -= goarch.PtrSize
 				*(*uintptr)(unsafe.Pointer(sp)) = newpc
 				c.set_sp(sp)
 				c.set_ip(targetPC)
