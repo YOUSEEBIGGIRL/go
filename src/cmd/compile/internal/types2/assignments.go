@@ -43,7 +43,7 @@ func (check *Checker) assignment(x *operand, T Type, context string) {
 				x.mode = invalid
 				return
 			}
-		} else if T == nil || IsInterface(T) {
+		} else if T == nil || IsInterface(T) && !isTypeParam(T) {
 			target = Default(x.typ)
 		}
 		newType, val, code := check.implicitTypeAndValue(x, target)
@@ -71,7 +71,7 @@ func (check *Checker) assignment(x *operand, T Type, context string) {
 	// x.typ is typed
 
 	// A generic (non-instantiated) function value cannot be assigned to a variable.
-	if sig := asSignature(x.typ); sig != nil && sig.TypeParams().Len() > 0 {
+	if sig, _ := under(x.typ).(*Signature); sig != nil && sig.TypeParams().Len() > 0 {
 		check.errorf(x, "cannot use generic function %s without instantiation in %s", x, context)
 	}
 
@@ -85,7 +85,11 @@ func (check *Checker) assignment(x *operand, T Type, context string) {
 	reason := ""
 	if ok, _ := x.assignableTo(check, T, &reason); !ok {
 		if check.conf.CompilerErrorMessages {
-			check.errorf(x, "incompatible type: cannot use %s as %s value", x, T)
+			if reason != "" {
+				check.errorf(x, "cannot use %s as type %s in %s:\n\t%s", x, T, context, reason)
+			} else {
+				check.errorf(x, "cannot use %s as type %s in %s", x, T, context)
+			}
 		} else {
 			if reason != "" {
 				check.errorf(x, "cannot use %s as %s value in %s: %s", x, T, context, reason)

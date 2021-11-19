@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build darwin || linux || windows
-// +build darwin linux windows
 
 package fuzz
 
@@ -14,6 +13,9 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 func TestMinimizeInput(t *testing.T) {
@@ -55,7 +57,7 @@ func TestMinimizeInput(t *testing.T) {
 				return fmt.Errorf("bad %v", e.Values[0])
 			},
 			input:    []interface{}{[]byte{1, 2, 3, 4, 5}},
-			expected: []interface{}{[]byte{2, 3}},
+			expected: []interface{}{[]byte("00")},
 		},
 		{
 			name: "set_of_bytes",
@@ -71,6 +73,18 @@ func TestMinimizeInput(t *testing.T) {
 			},
 			input:    []interface{}{[]byte{0, 1, 2, 3, 4, 5}},
 			expected: []interface{}{[]byte{0, 4, 5}},
+		},
+		{
+			name: "non_ascii_bytes",
+			fn: func(e CorpusEntry) error {
+				b := e.Values[0].([]byte)
+				if len(b) == 3 {
+					return fmt.Errorf("bad %v", e.Values[0])
+				}
+				return nil
+			},
+			input:    []interface{}{[]byte("ท")}, // ท is 3 bytes
+			expected: []interface{}{[]byte("000")},
 		},
 		{
 			name: "ones_string",
@@ -89,6 +103,31 @@ func TestMinimizeInput(t *testing.T) {
 			},
 			input:    []interface{}{"001010001000000000000000000"},
 			expected: []interface{}{"111"},
+		},
+		{
+			name: "string_length",
+			fn: func(e CorpusEntry) error {
+				b := e.Values[0].(string)
+				if len(b) == 5 {
+					return fmt.Errorf("bad %v", e.Values[0])
+				}
+				return nil
+			},
+			input:    []interface{}{"zzzzz"},
+			expected: []interface{}{"00000"},
+		},
+		{
+			name: "string_with_letter",
+			fn: func(e CorpusEntry) error {
+				b := e.Values[0].(string)
+				r, _ := utf8.DecodeRune([]byte(b))
+				if unicode.IsLetter(r) {
+					return fmt.Errorf("bad %v", e.Values[0])
+				}
+				return nil
+			},
+			input:    []interface{}{"ZZZZZ"},
+			expected: []interface{}{"A"},
 		},
 		{
 			name: "int",
@@ -241,7 +280,9 @@ func TestMinimizeInput(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			ws := &workerServer{
-				fuzzFn: tc.fn,
+				fuzzFn: func(e CorpusEntry) (time.Duration, error) {
+					return time.Second, tc.fn(e)
+				},
 			}
 			count := int64(0)
 			vals := tc.input
@@ -266,8 +307,8 @@ func TestMinimizeInput(t *testing.T) {
 // input and a flaky failure occurs, that minimization was not indicated
 // to be successful, and the error isn't returned (since it's flaky).
 func TestMinimizeFlaky(t *testing.T) {
-	ws := &workerServer{fuzzFn: func(e CorpusEntry) error {
-		return errors.New("ohno")
+	ws := &workerServer{fuzzFn: func(e CorpusEntry) (time.Duration, error) {
+		return time.Second, errors.New("ohno")
 	}}
 	keepCoverage := make([]byte, len(coverageSnapshot))
 	count := int64(0)

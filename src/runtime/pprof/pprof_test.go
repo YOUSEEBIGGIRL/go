@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build !js
-// +build !js
 
 package pprof
 
@@ -21,6 +20,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -116,6 +116,30 @@ func TestCPUProfileMultithreadMagnitude(t *testing.T) {
 		t.Skip("issue 35057 is only confirmed on Linux")
 	}
 
+	// Linux [5.9,5.16) has a kernel bug that can break CPU timers on newly
+	// created threads, breaking our CPU accounting.
+	major, minor, patch, err := linuxKernelVersion()
+	if err != nil {
+		t.Errorf("Error determining kernel version: %v", err)
+	}
+	t.Logf("Running on Linux %d.%d.%d", major, minor, patch)
+	defer func() {
+		if t.Failed() {
+			t.Logf("Failure of this test may indicate that your system suffers from a known Linux kernel bug fixed on newer kernels. See https://golang.org/issue/49065.")
+		}
+	}()
+
+	// Disable on affected builders to avoid flakiness, but otherwise keep
+	// it enabled to potentially warn users that they are on a broken
+	// kernel.
+	if testenv.Builder() != "" && (runtime.GOARCH == "386" || runtime.GOARCH == "amd64") {
+		have59 := major > 5 || (major == 5 && minor >= 9)
+		have516 := major > 5 || (major == 5 && minor >= 16)
+		if have59 && !have516 {
+			testenv.SkipFlaky(t, 49065)
+		}
+	}
+
 	// Run a workload in a single goroutine, then run copies of the same
 	// workload in several goroutines. For both the serial and parallel cases,
 	// the CPU time the process measures with its own profiler should match the
@@ -133,6 +157,14 @@ func TestCPUProfileMultithreadMagnitude(t *testing.T) {
 	}
 
 	parallelism := runtime.GOMAXPROCS(0)
+
+	// This test compares the process's total CPU time against the CPU
+	// profiler's view of time spent in direct execution of user code.
+	// Background work, especially from the garbage collector, adds noise to
+	// that measurement. Disable automatic triggering of the GC, and then
+	// request a complete GC cycle (up through sweep termination).
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	runtime.GC()
 
 	var cpuTime1, cpuTimeN time.Duration
 	p := testCPUProfile(t, stackContains, []string{"runtime/pprof.cpuHog1", "runtime/pprof.cpuHog3"}, avoidFunctions(), func(dur time.Duration) {
@@ -486,6 +518,7 @@ func profileOk(t *testing.T, matches matchFunc, need []string, avoid []string, p
 	p := parseProfile(t, prof.Bytes(), func(count uintptr, stk []*profile.Location, labels map[string][]string) {
 		fmt.Fprintf(&buf, "%d:", count)
 		fprintStack(&buf, stk)
+		fmt.Fprintf(&buf, " labels: %v\n", labels)
 		samples += count
 		for i, spec := range need {
 			if matches(spec, count, stk, labels) {
@@ -667,7 +700,6 @@ func fprintStack(w io.Writer, stk []*profile.Location) {
 		}
 		fmt.Fprintf(w, ")")
 	}
-	fmt.Fprintf(w, "\n")
 }
 
 // Test that profiling of division operations is okay, especially on ARM. See issue 6681.

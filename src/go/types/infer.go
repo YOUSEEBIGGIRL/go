@@ -118,17 +118,21 @@ func (check *Checker) infer(posn positioner, tparams []*TypeParam, targs []Type,
 				}
 			}
 			if allFailed {
-				check.errorf(arg, _Todo, "%s %s of %s does not match %s (cannot infer %s)", kind, targ, arg.expr, tpar, typeParamsString(tparams))
+				check.errorf(arg, _CannotInferTypeArgs, "%s %s of %s does not match %s (cannot infer %s)", kind, targ, arg.expr, tpar, typeParamsString(tparams))
 				return
 			}
 		}
 		smap := makeSubstMap(tparams, targs)
 		// TODO(rFindley): pass a positioner here, rather than arg.Pos().
 		inferred := check.subst(arg.Pos(), tpar, smap, nil)
+		// _CannotInferTypeArgs indicates a failure of inference, though the actual
+		// error may be better attributed to a user-provided type argument (hence
+		// _InvalidTypeArg). We can't differentiate these cases, so fall back on
+		// the more general _CannotInferTypeArgs.
 		if inferred != tpar {
-			check.errorf(arg, _Todo, "%s %s of %s does not match inferred type %s for %s", kind, targ, arg.expr, inferred, tpar)
+			check.errorf(arg, _CannotInferTypeArgs, "%s %s of %s does not match inferred type %s for %s", kind, targ, arg.expr, inferred, tpar)
 		} else {
-			check.errorf(arg, _Todo, "%s %s of %s does not match %s", kind, targ, arg.expr, tpar)
+			check.errorf(arg, _CannotInferTypeArgs, "%s %s of %s does not match %s", kind, targ, arg.expr, tpar)
 		}
 	}
 
@@ -214,7 +218,7 @@ func (check *Checker) infer(posn positioner, tparams []*TypeParam, targs []Type,
 	// At least one type argument couldn't be inferred.
 	assert(index >= 0 && targs[index] == nil)
 	tpar := tparams[index]
-	check.errorf(posn, _Todo, "cannot infer %s (%v) (%v)", tpar.obj.name, tpar.obj.pos, targs)
+	check.errorf(posn, _CannotInferTypeArgs, "cannot infer %s (%v)", tpar.obj.name, tpar.obj.pos)
 	return nil
 }
 
@@ -270,7 +274,7 @@ func (w *tpWalker) isParameterized(typ Type) (res bool) {
 	}()
 
 	switch t := typ.(type) {
-	case nil, *top, *Basic: // TODO(gri) should nil be handled here?
+	case nil, *Basic: // TODO(gri) should nil be handled here?
 		break
 
 	case *Array:
@@ -315,7 +319,7 @@ func (w *tpWalker) isParameterized(typ Type) (res bool) {
 			}
 		}
 		return tset.is(func(t *term) bool {
-			return w.isParameterized(t.typ)
+			return t != nil && w.isParameterized(t.typ)
 		})
 
 	case *Map:
@@ -358,7 +362,7 @@ func (w *tpWalker) isParameterizedTypeList(list []Type) bool {
 func (check *Checker) inferB(tparams []*TypeParam, targs []Type) (types []Type, index int) {
 	assert(len(tparams) >= len(targs) && len(targs) > 0)
 
-	// Setup bidirectional unification between those structural bounds
+	// Setup bidirectional unification between constraints
 	// and the corresponding type arguments (which may be nil!).
 	u := newUnifier(false)
 	u.x.init(tparams)
@@ -371,20 +375,26 @@ func (check *Checker) inferB(tparams []*TypeParam, targs []Type) (types []Type, 
 		}
 	}
 
-	// Unify type parameters with their structural constraints, if any.
+	// If a constraint has a structural type, unify the corresponding type parameter with it.
 	for _, tpar := range tparams {
-		typ := tpar
-		sbound := typ.structuralType()
+		sbound := structuralType(tpar)
 		if sbound != nil {
-			if !u.unify(typ, sbound) {
-				check.errorf(tpar.obj, _Todo, "%s does not match %s", tpar.obj, sbound)
+			// If the structural type is the underlying type of a single
+			// defined type in the constraint, use that defined type instead.
+			if named, _ := tpar.singleType().(*Named); named != nil {
+				sbound = named
+			}
+			if !u.unify(tpar, sbound) {
+				// TODO(gri) improve error message by providing the type arguments
+				//           which we know already
+				check.errorf(tpar.obj, _InvalidTypeArg, "%s does not match %s", tpar, sbound)
 				return nil, 0
 			}
 		}
 	}
 
 	// u.x.types() now contains the incoming type arguments plus any additional type
-	// arguments for which there were structural constraints. The newly inferred non-
+	// arguments which were inferred from structural types. The newly inferred non-
 	// nil entries may still contain references to other type parameters.
 	// For instance, for [A any, B interface{ []C }, C interface{ *A }], if A == int
 	// was given, unification produced the type list [int, []C, *A]. We eliminate the
@@ -499,7 +509,7 @@ func (w *cycleFinder) typ(typ Type) {
 	defer delete(w.seen, typ)
 
 	switch t := typ.(type) {
-	case *Basic, *top:
+	case *Basic:
 		// nothing to do
 
 	case *Array:

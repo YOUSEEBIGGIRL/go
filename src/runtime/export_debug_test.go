@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build amd64 && linux
-// +build amd64,linux
 
 package runtime
 
@@ -108,6 +107,10 @@ type debugCallHandler struct {
 }
 
 func (h *debugCallHandler) inject(info *siginfo, ctxt *sigctxt, gp2 *g) bool {
+	// TODO(49370): This code is riddled with write barriers, but called from
+	// a signal handler. Add the go:nowritebarrierrec annotation and restructure
+	// this to avoid write barriers.
+
 	switch h.gp.atomicstatus {
 	case _Grunning:
 		if getg().m != h.mp {
@@ -142,7 +145,11 @@ func (h *debugCallHandler) inject(info *siginfo, ctxt *sigctxt, gp2 *g) bool {
 }
 
 func (h *debugCallHandler) handle(info *siginfo, ctxt *sigctxt, gp2 *g) bool {
-	// Sanity check.
+	// TODO(49370): This code is riddled with write barriers, but called from
+	// a signal handler. Add the go:nowritebarrierrec annotation and restructure
+	// this to avoid write barriers.
+
+	// Double-check m.
 	if getg().m != h.mp {
 		println("trap on wrong M", getg().m, h.mp)
 		return false

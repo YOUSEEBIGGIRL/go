@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"reflect"
 	"testing"
+	"time"
 )
 
 var benchmarkWorkerFlag = flag.Bool("benchmarkworker", false, "")
@@ -36,7 +37,7 @@ func BenchmarkWorkerFuzzOverhead(b *testing.B) {
 	os.Setenv("GODEBUG", fmt.Sprintf("%s,fuzzseed=123", origEnv))
 
 	ws := &workerServer{
-		fuzzFn:     func(_ CorpusEntry) error { return nil },
+		fuzzFn:     func(_ CorpusEntry) (time.Duration, error) { return time.Second, nil },
 		workerComm: workerComm{memMu: make(chan *sharedMem, 1)},
 	}
 
@@ -96,7 +97,7 @@ func BenchmarkWorkerFuzz(b *testing.B) {
 			Limit:   int64(b.N) - i,
 			Timeout: workerFuzzDuration,
 		}
-		_, resp, err := w.client.fuzz(context.Background(), entry, args)
+		_, resp, _, err := w.client.fuzz(context.Background(), entry, args)
 		if err != nil {
 			b.Fatal(err)
 		}

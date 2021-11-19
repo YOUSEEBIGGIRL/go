@@ -18,6 +18,10 @@ import (
 const (
 	debug = false // leave on during development
 	trace = false // turn on for detailed type resolution traces
+
+	// TODO(rfindley): add compiler error message handling from types2, guarded
+	// behind this flag, so that we can keep the code in sync.
+	compilerErrorMessages = false // match compiler error messages
 )
 
 // If forceStrict is set, the type-checker enforces additional
@@ -41,22 +45,24 @@ type exprInfo struct {
 	val   constant.Value // constant value; or nil (if not a constant)
 }
 
-// A context represents the context within which an object is type-checked.
-type context struct {
+// An environment represents the environment within which an object is
+// type-checked.
+type environment struct {
 	decl          *declInfo              // package-level declaration whose init expression/function body is checked
 	scope         *Scope                 // top-most scope for lookups
 	pos           token.Pos              // if valid, identifiers are looked up as if at position pos (used by Eval)
 	iota          constant.Value         // value of iota in a constant declaration; nil otherwise
 	errpos        positioner             // if set, identifier position of a constant with inherited initializer
+	inTParamList  bool                   // set if inside a type parameter list
 	sig           *Signature             // function signature if inside a function; nil otherwise
 	isPanic       map[*ast.CallExpr]bool // set of panic call expressions (used for termination check)
 	hasLabel      bool                   // set if a function makes use of labels (only ~1% of functions); unused outside functions
 	hasCallOrRecv bool                   // set if an expression contains a function call or channel receive operation
 }
 
-// lookup looks up name in the current context and returns the matching object, or nil.
-func (ctxt *context) lookup(name string) Object {
-	_, obj := ctxt.scope.LookupParent(name, ctxt.pos)
+// lookup looks up name in the current environment and returns the matching object, or nil.
+func (env *environment) lookup(name string) Object {
+	_, obj := env.scope.LookupParent(name, env.pos)
 	return obj
 }
 
@@ -76,12 +82,35 @@ type dotImportKey struct {
 	name  string
 }
 
+// An action describes a (delayed) action.
+type action struct {
+	f    func()      // action to be executed
+	desc *actionDesc // action description; may be nil, requires debug to be set
+}
+
+// If debug is set, describef sets a printf-formatted description for action a.
+// Otherwise, it is a no-op.
+func (a *action) describef(pos positioner, format string, args ...interface{}) {
+	if debug {
+		a.desc = &actionDesc{pos, format, args}
+	}
+}
+
+// An actionDesc provides information on an action.
+// For debugging only.
+type actionDesc struct {
+	pos    positioner
+	format string
+	args   []interface{}
+}
+
 // A Checker maintains the state of the type checker.
 // It must be created with NewChecker.
 type Checker struct {
 	// package information
 	// (initialized by NewChecker, valid for the life-time of checker)
 	conf *Config
+	ctxt *Context // context for de-duplicating instances
 	fset *token.FileSet
 	pkg  *Package
 	*Info
@@ -107,16 +136,18 @@ type Checker struct {
 	imports       []*PkgName                // list of imported packages
 	dotImportMap  map[dotImportKey]*PkgName // maps dot-imported objects to the package they were dot-imported through
 	recvTParamMap map[*ast.Ident]*TypeParam // maps blank receiver type parameters to their type
+	mono          monoGraph                 // graph for detecting non-monomorphizable instantiation loops
 
 	firstErr error                 // first error encountered
 	methods  map[*TypeName][]*Func // maps package scope type names to associated non-blank (non-interface) methods
 	untyped  map[ast.Expr]exprInfo // map of expressions without final type
-	delayed  []func()              // stack of delayed action segments; segments are processed in FIFO order
+	delayed  []action              // stack of delayed action segments; segments are processed in FIFO order
 	objPath  []Object              // path of object dependencies during type inference (for cycle reporting)
+	defTypes []*Named              // defined types created during type checking, for final validation.
 
-	// context within which the current object is type-checked
-	// (valid only for the duration of type-checking a specific object)
-	context
+	// environment within which the current object is type-checked (valid only
+	// for the duration of type-checking a specific object)
+	environment
 
 	// debugging
 	indent int // indentation for tracing
@@ -147,8 +178,12 @@ func (check *Checker) rememberUntyped(e ast.Expr, lhs bool, mode operandMode, ty
 // either at the end of the current statement, or in case of a local constant
 // or variable declaration, before the constant or variable is in scope
 // (so that f still sees the scope before any new declarations).
-func (check *Checker) later(f func()) {
-	check.delayed = append(check.delayed, f)
+// later returns the pushed action so one can provide a description
+// via action.describef for debugging, if desired.
+func (check *Checker) later(f func()) *action {
+	i := len(check.delayed)
+	check.delayed = append(check.delayed, action{f: f})
+	return &check.delayed[i]
 }
 
 // push pushes obj onto the object path and returns its index in the path.
@@ -174,11 +209,6 @@ func NewChecker(conf *Config, fset *token.FileSet, pkg *Package, info *Info) *Ch
 		conf = new(Config)
 	}
 
-	// make sure we have a context
-	if conf.Context == nil {
-		conf.Context = NewContext()
-	}
-
 	// make sure we have an info struct
 	if info == nil {
 		info = new(Info)
@@ -191,6 +221,7 @@ func NewChecker(conf *Config, fset *token.FileSet, pkg *Package, info *Info) *Ch
 
 	return &Checker{
 		conf:    conf,
+		ctxt:    conf.Context,
 		fset:    fset,
 		pkg:     pkg,
 		Info:    info,
@@ -269,6 +300,8 @@ func (check *Checker) checkFiles(files []*ast.File) (err error) {
 
 	check.processDelayed(0) // incl. all functions
 
+	check.expandDefTypes()
+
 	check.initOrder()
 
 	if !check.conf.DisableUnusedImportCheck {
@@ -276,6 +309,11 @@ func (check *Checker) checkFiles(files []*ast.File) (err error) {
 	}
 
 	check.recordUntyped()
+
+	if check.firstErr == nil {
+		// TODO(mdempsky): Ensure monomorph is safe when errors exist.
+		check.monomorph()
+	}
 
 	check.pkg.complete = true
 
@@ -285,6 +323,8 @@ func (check *Checker) checkFiles(files []*ast.File) (err error) {
 	check.pkgPathMap = nil
 	check.seenPkgMap = nil
 	check.recvTParamMap = nil
+	check.defTypes = nil
+	check.ctxt = nil
 
 	// TODO(rFindley) There's more memory we should release at this point.
 
@@ -300,10 +340,38 @@ func (check *Checker) processDelayed(top int) {
 	// add more actions (such as nested functions), so
 	// this is a sufficiently bounded process.
 	for i := top; i < len(check.delayed); i++ {
-		check.delayed[i]() // may append to check.delayed
+		a := &check.delayed[i]
+		if trace && a.desc != nil {
+			fmt.Println()
+			check.trace(a.desc.pos.Pos(), "-- "+a.desc.format, a.desc.args...)
+		}
+		a.f() // may append to check.delayed
 	}
 	assert(top <= len(check.delayed)) // stack must not have shrunk
 	check.delayed = check.delayed[:top]
+}
+
+func (check *Checker) expandDefTypes() {
+	// Ensure that every defined type created in the course of type-checking has
+	// either non-*Named underlying, or is unresolved.
+	//
+	// This guarantees that we don't leak any types whose underlying is *Named,
+	// because any unresolved instances will lazily compute their underlying by
+	// substituting in the underlying of their origin. The origin must have
+	// either been imported or type-checked and expanded here, and in either case
+	// its underlying will be fully expanded.
+	for i := 0; i < len(check.defTypes); i++ {
+		n := check.defTypes[i]
+		switch n.underlying.(type) {
+		case nil:
+			if n.resolver == nil {
+				panic("nil underlying")
+			}
+		case *Named:
+			n.under() // n.under may add entries to check.defTypes
+		}
+		n.check = nil
+	}
 }
 
 func (check *Checker) record(x *operand) {
@@ -355,9 +423,9 @@ func (check *Checker) recordTypeAndValue(x ast.Expr, mode operandMode, typ Type,
 	}
 	if mode == constant_ {
 		assert(val != nil)
-		// We check is(typ, IsConstType) here as constant expressions may be
+		// We check allBasic(typ, IsConstType) here as constant expressions may be
 		// recorded as type parameters.
-		assert(typ == Typ[Invalid] || is(typ, IsConstType))
+		assert(typ == Typ[Invalid] || allBasic(typ, IsConstType))
 	}
 	if m := check.Types; m != nil {
 		m[x] = TypeAndValue{mode, typ, val}

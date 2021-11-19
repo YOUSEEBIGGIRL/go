@@ -16,7 +16,7 @@ import (
 // The operand x must be the evaluation of inst.X and its type must be a signature.
 func (check *Checker) funcInst(x *operand, inst *syntax.IndexExpr) {
 	if !check.allowVersion(check.pkg, 1, 18) {
-		check.softErrorf(inst.Pos(), "function instantiation requires go1.18 or later")
+		check.versionErrorf(inst.Pos(), "go1.18", "function instantiation")
 	}
 
 	xlist := unpackExpr(inst.Index)
@@ -57,12 +57,42 @@ func (check *Checker) funcInst(x *operand, inst *syntax.IndexExpr) {
 	}
 
 	// instantiate function signature
-	res := check.instantiate(x.Pos(), sig, targs, poslist).(*Signature)
+	res := check.instantiateSignature(x.Pos(), sig, targs, poslist)
 	assert(res.TypeParams().Len() == 0) // signature is not generic anymore
 	check.recordInstance(inst.X, targs, res)
 	x.typ = res
 	x.mode = value
 	x.expr = inst
+}
+
+func (check *Checker) instantiateSignature(pos syntax.Pos, typ *Signature, targs []Type, posList []syntax.Pos) (res *Signature) {
+	assert(check != nil)
+	assert(len(targs) == typ.TypeParams().Len())
+
+	if check.conf.Trace {
+		check.trace(pos, "-- instantiating %s with %s", typ, targs)
+		check.indent++
+		defer func() {
+			check.indent--
+			check.trace(pos, "=> %s (under = %s)", res, res.Underlying())
+		}()
+	}
+
+	inst := check.instance(pos, typ, targs, check.bestContext(nil)).(*Signature)
+	assert(len(posList) <= len(targs))
+	tparams := typ.TypeParams().list()
+	if i, err := check.verify(pos, tparams, targs); err != nil {
+		// best position for error reporting
+		pos := pos
+		if i < len(posList) {
+			pos = posList[i]
+		}
+		check.softErrorf(pos, err.Error())
+	} else {
+		check.mono.recordInstance(check.pkg, pos, tparams, targs, posList)
+	}
+
+	return inst
 }
 
 func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
@@ -102,9 +132,9 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 		case 1:
 			check.expr(x, call.ArgList[0])
 			if x.mode != invalid {
-				if t := asInterface(T); t != nil {
+				if t, _ := under(T).(*Interface); t != nil && !isTypeParam(T) {
 					if !t.IsMethodSet() {
-						check.errorf(call, "cannot use interface %s in conversion (contains type list or is comparable)", T)
+						check.errorf(call, "cannot use interface %s in conversion (contains specific type constraints or is comparable)", T)
 						break
 					}
 				}
@@ -139,7 +169,8 @@ func (check *Checker) callExpr(x *operand, call *syntax.CallExpr) exprKind {
 	// signature may be generic
 	cgocall := x.mode == cgofunc
 
-	sig := asSignature(x.typ)
+	// a type parameter may be "called" if all types have the same signature
+	sig, _ := structuralType(x.typ).(*Signature)
 	if sig == nil {
 		check.errorf(x, invalidOp+"cannot call non-function %s", x)
 		x.mode = invalid
@@ -332,9 +363,9 @@ func (check *Checker) arguments(call *syntax.CallExpr, sig *Signature, targs []T
 	if sig.TypeParams().Len() > 0 {
 		if !check.allowVersion(check.pkg, 1, 18) {
 			if iexpr, _ := call.Fun.(*syntax.IndexExpr); iexpr != nil {
-				check.softErrorf(iexpr.Pos(), "function instantiation requires go1.18 or later")
+				check.versionErrorf(iexpr.Pos(), "go1.18", "function instantiation")
 			} else {
-				check.softErrorf(call.Pos(), "implicit function instantiation requires go1.18 or later")
+				check.versionErrorf(call.Pos(), "go1.18", "implicit function instantiation")
 			}
 		}
 		// TODO(gri) provide position information for targs so we can feed
@@ -345,7 +376,7 @@ func (check *Checker) arguments(call *syntax.CallExpr, sig *Signature, targs []T
 		}
 
 		// compute result signature
-		rsig = check.instantiate(call.Pos(), sig, targs, nil).(*Signature)
+		rsig = check.instantiateSignature(call.Pos(), sig, targs, nil)
 		assert(rsig.TypeParams().Len() == 0) // signature is not generic anymore
 		check.recordInstance(call.Fun, targs, rsig)
 
@@ -497,7 +528,7 @@ func (check *Checker) selector(x *operand, e *syntax.SelectorExpr) {
 			check.errorf(e.Sel, "cannot call pointer method %s on %s", sel, x.typ)
 		default:
 			var why string
-			if tpar := asTypeParam(x.typ); tpar != nil {
+			if tpar, _ := x.typ.(*TypeParam); tpar != nil {
 				// Type parameter bounds don't specify fields, so don't mention "field".
 				if tname := tpar.iface().obj; tname != nil {
 					why = check.sprintf("interface %s has no method %s", tname.name, sel)

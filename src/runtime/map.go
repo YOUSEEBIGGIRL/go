@@ -585,6 +585,10 @@ func mapaccess1(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 		msanread(key, t.key.size)
 	}
 
+	if asanenabled && h != nil {
+		asanread(key, t.key.size)
+	}
+
 	// 如果 map 为空或者元素个数为 0，返回零值
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {
@@ -674,6 +678,9 @@ func mapaccess2(t *maptype, h *hmap, key unsafe.Pointer) (unsafe.Pointer, bool) 
 	}
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
+	}
+	if asanenabled && h != nil {
+		asanread(key, t.key.size)
 	}
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {
@@ -802,6 +809,10 @@ func mapassign(t *maptype, h *hmap, key unsafe.Pointer) unsafe.Pointer {
 	}
 	if msanenabled {
 		msanread(key, t.key.size)
+	}
+
+	if asanenabled {
+		asanread(key, t.key.size)
 	}
 
 	// 有其他 goroutine 正在往 map 中写 key，会抛出以下错误
@@ -964,6 +975,9 @@ func mapdelete(t *maptype, h *hmap, key unsafe.Pointer) {
 	}
 	if msanenabled && h != nil {
 		msanread(key, t.key.size)
+	}
+	if asanenabled && h != nil {
+		asanread(key, t.key.size)
 	}
 	if h == nil || h.count == 0 {
 		if t.hashMightPanic() {

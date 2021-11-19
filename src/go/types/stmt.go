@@ -29,13 +29,13 @@ func (check *Checker) funcBody(decl *declInfo, name string, sig *Signature, body
 	sig.scope.pos = body.Pos()
 	sig.scope.end = body.End()
 
-	// save/restore current context and setup function context
+	// save/restore current environment and set up function environment
 	// (and use 0 indentation at function start)
-	defer func(ctxt context, indent int) {
-		check.context = ctxt
+	defer func(env environment, indent int) {
+		check.environment = env
 		check.indent = indent
-	}(check.context, check.indent)
-	check.context = context{
+	}(check.environment, check.indent)
+	check.environment = environment{
 		decl:  decl,
 		scope: sig.scope,
 		iota:  iota,
@@ -417,27 +417,21 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		if ch.mode == invalid || val.mode == invalid {
 			return
 		}
-		var elem Type
-		if !underIs(ch.typ, func(u Type) bool {
-			uch, _ := u.(*Chan)
-			if uch == nil {
-				check.invalidOp(inNode(s, s.Arrow), _InvalidSend, "cannot send to non-channel %s", &ch)
-				return false
-			}
-			if uch.dir == RecvOnly {
-				check.invalidOp(inNode(s, s.Arrow), _InvalidSend, "cannot send to receive-only channel %s", &ch)
-				return false
-			}
-			if elem != nil && !Identical(uch.elem, elem) {
-				check.invalidOp(inNode(s, s.Arrow), _Todo, "channels of %s must have the same element type", &ch)
-				return false
-			}
-			elem = uch.elem
-			return true
-		}) {
+		u := structuralType(ch.typ)
+		if u == nil {
+			check.invalidOp(inNode(s, s.Arrow), _InvalidSend, "cannot send to %s: no structural type", &ch)
 			return
 		}
-		check.assignment(&val, elem, "send")
+		uch, _ := u.(*Chan)
+		if uch == nil {
+			check.invalidOp(inNode(s, s.Arrow), _InvalidSend, "cannot send to non-channel %s", &ch)
+			return
+		}
+		if uch.dir == RecvOnly {
+			check.invalidOp(inNode(s, s.Arrow), _InvalidSend, "cannot send to receive-only channel %s", &ch)
+			return
+		}
+		check.assignment(&val, uch.elem, "send")
 
 	case *ast.IncDecStmt:
 		var op token.Token
@@ -456,7 +450,7 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		if x.mode == invalid {
 			return
 		}
-		if !isNumeric(x.typ) {
+		if !allNumeric(x.typ) {
 			check.invalidOp(s.X, _NonNumericIncDec, "%s%s (non-numeric type %s)", s.X, s.Tok, x.typ)
 			return
 		}
@@ -572,7 +566,7 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		check.simpleStmt(s.Init)
 		var x operand
 		check.expr(&x, s.Cond)
-		if x.mode != invalid && !isBoolean(x.typ) {
+		if x.mode != invalid && !allBoolean(x.typ) {
 			check.error(s.Cond, _InvalidCond, "non-boolean condition in if statement")
 		}
 		check.stmt(inner, s.Body)
@@ -691,6 +685,11 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		if x.mode == invalid {
 			return
 		}
+		// TODO(gri) we may want to permit type switches on type parameter values at some point
+		if isTypeParam(x.typ) {
+			check.errorf(&x, _InvalidTypeSwitch, "cannot use type switch on type parameter value %s", &x)
+			return
+		}
 		xtyp, _ := under(x.typ).(*Interface)
 		if xtyp == nil {
 			check.errorf(&x, _InvalidTypeSwitch, "%s is not an interface", &x)
@@ -804,7 +803,7 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		if s.Cond != nil {
 			var x operand
 			check.expr(&x, s.Cond)
-			if x.mode != invalid && !isBoolean(x.typ) {
+			if x.mode != invalid && !allBoolean(x.typ) {
 				check.error(s.Cond, _InvalidCond, "non-boolean condition in for statement")
 			}
 		}
@@ -833,19 +832,27 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		var key, val Type
 		if x.mode != invalid {
 			// Ranging over a type parameter is permitted if it has a structural type.
-			typ := optype(x.typ)
-			if _, ok := typ.(*Chan); ok && s.Value != nil {
-				check.softErrorf(atPos(s.Value.Pos()), _InvalidIterVar, "range over %s permits only one iteration variable", &x)
-				// ok to continue
-			}
-			var msg string
-			key, val, msg = rangeKeyVal(typ, isVarName(s.Key), isVarName(s.Value))
-			if key == nil || msg != "" {
-				if msg != "" {
-					// TODO(rFindley) should this be parenthesized, to be consistent with other qualifiers?
-					msg = ": " + msg
+			var cause string
+			u := structuralType(x.typ)
+			switch t := u.(type) {
+			case nil:
+				cause = check.sprintf("%s has no structural type", x.typ)
+			case *Chan:
+				if s.Value != nil {
+					check.softErrorf(s.Value, _InvalidIterVar, "range over %s permits only one iteration variable", &x)
+					// ok to continue
 				}
-				check.softErrorf(&x, _InvalidRangeExpr, "cannot range over %s%s", &x, msg)
+				if t.dir == SendOnly {
+					cause = "receive from send-only channel"
+				}
+			}
+			key, val = rangeKeyVal(u)
+			if key == nil || cause != "" {
+				if cause == "" {
+					check.softErrorf(&x, _InvalidRangeExpr, "cannot range over %s", &x)
+				} else {
+					check.softErrorf(&x, _InvalidRangeExpr, "cannot range over %s (%s)", &x, cause)
+				}
 				// ok to continue
 			}
 		}
@@ -930,44 +937,23 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 	}
 }
 
-// isVarName reports whether x is a non-nil, non-blank (_) expression.
-func isVarName(x ast.Expr) bool {
-	if x == nil {
-		return false
-	}
-	ident, _ := unparen(x).(*ast.Ident)
-	return ident == nil || ident.Name != "_"
-}
-
 // rangeKeyVal returns the key and value type produced by a range clause
-// over an expression of type typ, and possibly an error message. If the
-// range clause is not permitted the returned key is nil or msg is not
-// empty (in that case we still may have a non-nil key type which can be
-// used to reduce the chance for follow-on errors).
-// The wantKey, wantVal, and hasVal flags indicate which of the iteration
-// variables are used or present; this matters if we range over a generic
-// type where not all keys or values are of the same type.
-func rangeKeyVal(typ Type, wantKey, wantVal bool) (Type, Type, string) {
+// over an expression of type typ. If the range clause is not permitted
+// the results are nil.
+func rangeKeyVal(typ Type) (key, val Type) {
 	switch typ := arrayPtrDeref(typ).(type) {
 	case *Basic:
 		if isString(typ) {
-			return Typ[Int], universeRune, "" // use 'rune' name
+			return Typ[Int], universeRune // use 'rune' name
 		}
 	case *Array:
-		return Typ[Int], typ.elem, ""
+		return Typ[Int], typ.elem
 	case *Slice:
-		return Typ[Int], typ.elem, ""
+		return Typ[Int], typ.elem
 	case *Map:
-		return typ.key, typ.elem, ""
+		return typ.key, typ.elem
 	case *Chan:
-		var msg string
-		if typ.dir == SendOnly {
-			msg = "receive from send-only channel"
-		}
-		return typ.elem, Typ[Invalid], msg
-	case *top:
-		// we have a type parameter with no structural type
-		return nil, nil, "no structural type"
+		return typ.elem, Typ[Invalid]
 	}
-	return nil, nil, ""
+	return
 }

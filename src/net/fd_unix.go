@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package net
 
@@ -92,12 +91,11 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
 	}
 
 	// Start the "interrupter" goroutine, if this context might be canceled.
-	// (The background context cannot)
 	//
 	// The interrupter goroutine waits for the context to be done and
 	// interrupts the dial (by altering the fd's write deadline, which
 	// wakes up waitWrite).
-	if ctx != context.Background() {
+	if ctxDone := ctx.Done(); ctxDone != nil {
 		// Wait for the interrupter goroutine to exit before returning
 		// from connect.
 		done := make(chan struct{})
@@ -117,7 +115,7 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa sysc
 		}()
 		go func() {
 			select {
-			case <-ctx.Done():
+			case <-ctxDone:
 				// Force the runtime's poller to immediately give up
 				// waiting for writability, unblocking waitWrite
 				// below.

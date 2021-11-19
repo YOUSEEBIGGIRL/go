@@ -142,7 +142,7 @@ func (w *worker) coordinate(ctx context.Context) error {
 			}
 			// Worker exited non-zero or was terminated by a non-interrupt
 			// signal (for example, SIGSEGV) while fuzzing.
-			return fmt.Errorf("fuzzing process terminated unexpectedly: %w", err)
+			return fmt.Errorf("fuzzing process hung or terminated unexpectedly: %w", err)
 			// TODO(jayconrod,katiehockman): if -keepfuzzing, restart worker.
 
 		case input := <-w.coordinator.inputC:
@@ -153,7 +153,7 @@ func (w *worker) coordinate(ctx context.Context) error {
 				Warmup:       input.warmup,
 				CoverageData: input.coverageData,
 			}
-			entry, resp, err := w.client.fuzz(ctx, input.entry, args)
+			entry, resp, isInternalError, err := w.client.fuzz(ctx, input.entry, args)
 			canMinimize := true
 			if err != nil {
 				// Error communicating with worker.
@@ -167,14 +167,6 @@ func (w *worker) coordinate(ctx context.Context) error {
 					// Report an error, but don't record a crasher.
 					return fmt.Errorf("communicating with fuzzing process: %v", err)
 				}
-				if w.waitErr == nil || isInterruptError(w.waitErr) {
-					// Worker stopped, either by exiting with status 0 or after being
-					// interrupted with a signal (not sent by coordinator). See comment in
-					// termC case above.
-					//
-					// Since we expect I/O errors around interrupts, ignore this error.
-					return nil
-				}
 				if sig, ok := terminationSignal(w.waitErr); ok && !isCrashSignal(sig) {
 					// Worker terminated by a signal that probably wasn't caused by a
 					// specific input to the fuzz function. For example, on Linux,
@@ -183,10 +175,15 @@ func (w *worker) coordinate(ctx context.Context) error {
 					// is closed. Don't record a crasher.
 					return fmt.Errorf("fuzzing process terminated by unexpected signal; no crash will be recorded: %v", w.waitErr)
 				}
+				if isInternalError {
+					// An internal error occurred which shouldn't be considered
+					// a crash.
+					return err
+				}
 				// Unexpected termination. Set error message and fall through.
 				// We'll restart the worker on the next iteration.
 				// Don't attempt to minimize this since it crashed the worker.
-				resp.Err = fmt.Sprintf("fuzzing process terminated unexpectedly: %v", w.waitErr)
+				resp.Err = fmt.Sprintf("fuzzing process hung or terminated unexpectedly: %v", w.waitErr)
 				canMinimize = false
 			}
 			result := fuzzResult{
@@ -258,7 +255,7 @@ func (w *worker) minimize(ctx context.Context, input fuzzMinimizeInput) (min fuz
 				limit:        input.limit,
 			}, nil
 		}
-		return fuzzResult{}, fmt.Errorf("fuzzing process terminated unexpectedly while minimizing: %w", w.waitErr)
+		return fuzzResult{}, fmt.Errorf("fuzzing process hung or terminated unexpectedly while minimizing: %w", w.waitErr)
 	}
 
 	if input.crasherMsg != "" && resp.Err == "" {
@@ -474,8 +471,16 @@ func RunFuzzWorker(ctx context.Context, fn func(CorpusEntry) error) error {
 	}
 	srv := &workerServer{
 		workerComm: comm,
-		fuzzFn:     fn,
-		m:          newMutator(),
+		fuzzFn: func(e CorpusEntry) (time.Duration, error) {
+			timer := time.AfterFunc(10*time.Second, func() {
+				panic("deadlocked!") // this error message won't be printed
+			})
+			defer timer.Stop()
+			start := time.Now()
+			err := fn(e)
+			return time.Since(start), err
+		},
+		m: newMutator(),
 	}
 	return srv.serve(ctx)
 }
@@ -567,6 +572,10 @@ type fuzzResponse struct {
 	// Err is the error string caused by the value in shared memory, which is
 	// non-empty if the value in shared memory caused a crash.
 	Err string
+
+	// InternalErr is the error string caused by an internal error in the
+	// worker. This shouldn't be considered a crasher.
+	InternalErr string
 }
 
 // pingArgs contains arguments to workerServer.ping.
@@ -603,9 +612,12 @@ type workerServer struct {
 	// coverage is found.
 	coverageMask []byte
 
-	// fuzzFn runs the worker's fuzz function on the given input and returns
-	// an error if it finds a crasher (the process may also exit or crash).
-	fuzzFn func(CorpusEntry) error
+	// fuzzFn runs the worker's fuzz target on the given input and returns an
+	// error if it finds a crasher (the process may also exit or crash), and the
+	// time it took to run the input. It sets a deadline of 10 seconds, at which
+	// point it will panic with the assumption that the process is hanging or
+	// deadlocked.
+	fuzzFn func(CorpusEntry) (time.Duration, error)
 }
 
 // serve reads serialized RPC messages on fuzzIn. When serve receives a message,
@@ -649,6 +661,17 @@ func (ws *workerServer) serve(ctx context.Context) error {
 	}
 }
 
+// chainedMutations is how many mutations are applied before the worker
+// resets the input to it's original state.
+// NOTE: this number was picked without much thought. It is low enough that
+// it seems to create a significant diversity in mutated inputs. We may want
+// to consider looking into this more closely once we have a proper performance
+// testing framework. Another option is to randomly pick the number of chained
+// mutations on each invocation of the workerServer.fuzz method (this appears to
+// be what libFuzzer does, although there seems to be no documentation which
+// explains why this choice was made.)
+const chainedMutations = 5
+
 // fuzz runs the test function on random variations of the input value in shared
 // memory for a limited duration or number of iterations.
 //
@@ -663,7 +686,8 @@ func (ws *workerServer) serve(ctx context.Context) error {
 func (ws *workerServer) fuzz(ctx context.Context, args fuzzArgs) (resp fuzzResponse) {
 	if args.CoverageData != nil {
 		if ws.coverageMask != nil && len(args.CoverageData) != len(ws.coverageMask) {
-			panic(fmt.Sprintf("unexpected size for CoverageData: got %d, expected %d", len(args.CoverageData), len(ws.coverageMask)))
+			resp.InternalErr = fmt.Sprintf("unexpected size for CoverageData: got %d, expected %d", len(args.CoverageData), len(ws.coverageMask))
+			return resp
 		}
 		ws.coverageMask = args.CoverageData
 	}
@@ -682,22 +706,25 @@ func (ws *workerServer) fuzz(ctx context.Context, args fuzzArgs) (resp fuzzRespo
 		ws.memMu <- mem
 	}()
 	if args.Limit > 0 && mem.header().count >= args.Limit {
-		panic(fmt.Sprintf("mem.header().count %d already exceeds args.Limit %d", mem.header().count, args.Limit))
+		resp.InternalErr = fmt.Sprintf("mem.header().count %d already exceeds args.Limit %d", mem.header().count, args.Limit)
+		return resp
 	}
 
-	vals, err := unmarshalCorpusFile(mem.valueCopy())
+	originalVals, err := unmarshalCorpusFile(mem.valueCopy())
 	if err != nil {
-		panic(err)
+		resp.InternalErr = err.Error()
+		return resp
 	}
+	vals := make([]interface{}, len(originalVals))
+	copy(vals, originalVals)
 
 	shouldStop := func() bool {
 		return args.Limit > 0 && mem.header().count >= args.Limit
 	}
 	fuzzOnce := func(entry CorpusEntry) (dur time.Duration, cov []byte, errMsg string) {
 		mem.header().count++
-		start := time.Now()
-		err := ws.fuzzFn(entry)
-		dur = time.Since(start)
+		var err error
+		dur, err = ws.fuzzFn(entry)
 		if err != nil {
 			errMsg = err.Error()
 			if errMsg == "" {
@@ -728,9 +755,13 @@ func (ws *workerServer) fuzz(ctx context.Context, args fuzzArgs) (resp fuzzRespo
 		select {
 		case <-ctx.Done():
 			return resp
-
 		default:
+			if mem.header().count%chainedMutations == 0 {
+				copy(vals, originalVals)
+				ws.m.r.save(&mem.header().randState, &mem.header().randInc)
+			}
 			ws.m.mutate(vals, cap(mem.valueRef()))
+
 			entry := CorpusEntry{Values: vals}
 			dur, cov, errMsg := fuzzOnce(entry)
 			if errMsg != "" {
@@ -738,20 +769,9 @@ func (ws *workerServer) fuzz(ctx context.Context, args fuzzArgs) (resp fuzzRespo
 				return resp
 			}
 			if cov != nil {
-				// Found new coverage. Before reporting to the coordinator,
-				// run the same values once more to deflake.
-				if !shouldStop() {
-					dur, cov, errMsg = fuzzOnce(entry)
-					if errMsg != "" {
-						resp.Err = errMsg
-						return resp
-					}
-				}
-				if cov != nil {
-					resp.CoverageData = cov
-					resp.InterestingDuration = dur
-					return resp
-				}
+				resp.CoverageData = cov
+				resp.InterestingDuration = dur
+				return resp
 			}
 			if shouldStop() {
 				return resp
@@ -810,7 +830,7 @@ func (ws *workerServer) minimizeInput(ctx context.Context, vals []interface{}, c
 	// If not, then whatever caused us to think the value was interesting may
 	// have been a flake, and we can't minimize it.
 	*count++
-	retErr = ws.fuzzFn(CorpusEntry{Values: vals})
+	_, retErr = ws.fuzzFn(CorpusEntry{Values: vals})
 	if keepCoverage != nil {
 		if !hasCoverageBit(keepCoverage, coverageSnapshot) || retErr != nil {
 			return false, nil
@@ -877,7 +897,7 @@ func (ws *workerServer) minimizeInput(ctx context.Context, vals []interface{}, c
 			panic("impossible")
 		}
 		*count++
-		err := ws.fuzzFn(CorpusEntry{Values: vals})
+		_, err := ws.fuzzFn(CorpusEntry{Values: vals})
 		if err != nil {
 			retErr = err
 			if keepCoverage != nil {
@@ -1038,7 +1058,7 @@ func (wc *workerClient) minimize(ctx context.Context, entryIn CorpusEntry, args 
 		entryOut.Parent = entryIn.Parent
 		entryOut.Generation = entryIn.Generation
 		if err != nil {
-			panic(fmt.Sprintf("workerClient.minimize unmarshaling minimized value: %v", err))
+			return CorpusEntry{}, minimizeResponse{}, fmt.Errorf("workerClient.minimize unmarshaling minimized value: %v", err)
 		}
 	} else {
 		// Did not minimize, but the original input may still be interesting,
@@ -1050,45 +1070,48 @@ func (wc *workerClient) minimize(ctx context.Context, entryIn CorpusEntry, args 
 }
 
 // fuzz tells the worker to call the fuzz method. See workerServer.fuzz.
-func (wc *workerClient) fuzz(ctx context.Context, entryIn CorpusEntry, args fuzzArgs) (entryOut CorpusEntry, resp fuzzResponse, err error) {
+func (wc *workerClient) fuzz(ctx context.Context, entryIn CorpusEntry, args fuzzArgs) (entryOut CorpusEntry, resp fuzzResponse, isInternalError bool, err error) {
 	wc.mu.Lock()
 	defer wc.mu.Unlock()
 
 	mem, ok := <-wc.memMu
 	if !ok {
-		return CorpusEntry{}, fuzzResponse{}, errSharedMemClosed
+		return CorpusEntry{}, fuzzResponse{}, true, errSharedMemClosed
 	}
 	mem.header().count = 0
 	inp, err := CorpusEntryData(entryIn)
 	if err != nil {
-		return CorpusEntry{}, fuzzResponse{}, err
+		return CorpusEntry{}, fuzzResponse{}, true, err
 	}
 	mem.setValue(inp)
 	wc.memMu <- mem
 
 	c := call{Fuzz: &args}
 	callErr := wc.callLocked(ctx, c, &resp)
+	if resp.InternalErr != "" {
+		return CorpusEntry{}, fuzzResponse{}, true, errors.New(resp.InternalErr)
+	}
 	mem, ok = <-wc.memMu
 	if !ok {
-		return CorpusEntry{}, fuzzResponse{}, errSharedMemClosed
+		return CorpusEntry{}, fuzzResponse{}, true, errSharedMemClosed
 	}
 	defer func() { wc.memMu <- mem }()
 	resp.Count = mem.header().count
 
 	if !bytes.Equal(inp, mem.valueRef()) {
-		panic("workerServer.fuzz modified input")
+		return CorpusEntry{}, fuzzResponse{}, true, errors.New("workerServer.fuzz modified input")
 	}
 	needEntryOut := callErr != nil || resp.Err != "" ||
 		(!args.Warmup && resp.CoverageData != nil)
 	if needEntryOut {
 		valuesOut, err := unmarshalCorpusFile(inp)
 		if err != nil {
-			panic(fmt.Sprintf("unmarshaling fuzz input value after call: %v", err))
+			return CorpusEntry{}, fuzzResponse{}, true, fmt.Errorf("unmarshaling fuzz input value after call: %v", err)
 		}
 		wc.m.r.restore(mem.header().randState, mem.header().randInc)
 		if !args.Warmup {
 			// Only mutate the valuesOut if fuzzing actually occurred.
-			for i := int64(0); i < mem.header().count; i++ {
+			for i := int64(0); i < resp.Count%chainedMutations; i++ {
 				wc.m.mutate(valuesOut, cap(mem.valueRef()))
 			}
 		}
@@ -1109,7 +1132,7 @@ func (wc *workerClient) fuzz(ctx context.Context, entryIn CorpusEntry, args fuzz
 		}
 	}
 
-	return entryOut, resp, callErr
+	return entryOut, resp, false, callErr
 }
 
 // ping tells the worker to call the ping method. See workerServer.ping.

@@ -215,7 +215,7 @@ var DefaultServer = NewServer()
 
 // Is this type exported or a builtin?
 func isExportedOrBuiltinType(t reflect.Type) bool {
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	// PkgPath will be non-empty even for an exported type,
@@ -285,7 +285,7 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 
 		// To help the user, see if a pointer receiver would work.
 		// 可能方法的接受者是指针类型，用指针类型获取方法
-		method := suitableMethods(reflect.PtrTo(s.typ), false)
+		method := suitableMethods(reflect.PointerTo(s.typ), false)
 		// 如果指针下有方法，说明用户调用 register 时传错了对象，比如：
 		// type A struct {}
 		// func (a *A) fn() {}
@@ -346,7 +346,7 @@ func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 		// Second arg must be a pointer.
 		// 第二个参数是调用方法的参数，必须是指针类型
 		replyType := mtype.In(2)
-		if replyType.Kind() != reflect.Ptr {
+		if replyType.Kind() != reflect.Pointer {
 			if logErr {
 				log.Printf("rpc.Register: reply type of method %q is not a pointer: %q\n", mname, replyType)
 			}
@@ -619,7 +619,7 @@ func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *m
 
 	// Decode the argument value.
 	argIsValue := false // if true, need to indirect before calling.
-	if mtype.ArgType.Kind() == reflect.Ptr {
+	if mtype.ArgType.Kind() == reflect.Pointer {
 		argv = reflect.New(mtype.ArgType.Elem())
 	} else {
 		argv = reflect.New(mtype.ArgType)

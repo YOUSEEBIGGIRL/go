@@ -235,12 +235,6 @@ func (g *irgen) selectorExpr(pos src.XPos, typ types2.Type, expr *syntax.Selecto
 		return DotField(pos, x, last)
 	}
 
-	// TODO(danscales,mdempsky): Interface method sets are not sorted the
-	// same between types and types2. In particular, using "last" here
-	// without conversion will likely fail if an interface contains
-	// unexported methods from two different packages (due to cross-package
-	// interface embedding).
-
 	var n ir.Node
 	method2 := selinfo.Obj().(*types2.Func)
 
@@ -272,7 +266,7 @@ func (g *irgen) selectorExpr(pos src.XPos, typ types2.Type, expr *syntax.Selecto
 			if wantPtr {
 				recvType2Base = types2.AsPointer(recvType2).Elem()
 			}
-			if types2.AsNamed(recvType2Base).TypeParams().Len() > 0 {
+			if recvType2Base.(*types2.Named).TypeParams().Len() > 0 {
 				// recvType2 is the original generic type that is
 				// instantiated for this method call.
 				// selinfo.Recv() is the instantiated type
@@ -344,7 +338,7 @@ func (g *irgen) compLit(typ types2.Type, lit *syntax.CompositeLit) ir.Node {
 		return typed(g.typ(typ), n)
 	}
 
-	_, isStruct := typ.Underlying().(*types2.Struct)
+	_, isStruct := types2.StructuralType(typ).(*types2.Struct)
 
 	exprs := make([]ir.Node, len(lit.ElemList))
 	for i, elem := range lit.ElemList {

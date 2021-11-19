@@ -55,17 +55,14 @@ func (err Error) FullError() string {
 	return fmt.Sprintf("%s: %s", err.Pos, err.Full)
 }
 
-// An ArgumentError holds an error that is associated with an argument.
+// An ArgumentError holds an error associated with an argument index.
 type ArgumentError struct {
-	index int
-	error
+	Index int
+	Err   error
 }
 
-// Index returns the positional index of the argument associated with the
-// error.
-func (e ArgumentError) Index() int {
-	return e.index
-}
+func (e *ArgumentError) Error() string { return e.Err.Error() }
+func (e *ArgumentError) Unwrap() error { return e.Err }
 
 // An Importer resolves import paths to Packages.
 //
@@ -438,7 +435,7 @@ func AssignableTo(V, T Type) bool {
 // ConvertibleTo reports whether a value of type V is convertible to a value of type T.
 func ConvertibleTo(V, T Type) bool {
 	x := operand{mode: value, typ: V}
-	return x.convertibleTo(nil, T) // check not needed for non-constant x
+	return x.convertibleTo(nil, T, nil) // check not needed for non-constant x
 }
 
 // Implements reports whether type V implements interface T.

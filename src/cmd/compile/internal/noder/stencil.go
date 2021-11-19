@@ -22,7 +22,7 @@ import (
 )
 
 // Enable extra consistency checks.
-const doubleCheck = true
+const doubleCheck = false
 
 func assert(p bool) {
 	base.Assert(p)
@@ -185,7 +185,7 @@ func (g *genInst) scanForGenCalls(decl ir.Node) {
 			// it before installing the instantiation, so we are
 			// checking against non-shape param types in
 			// typecheckaste.
-			transformCall(call, nil)
+			transformCall(call)
 
 			// Replace the OFUNCINST with a direct reference to the
 			// new stenciled function
@@ -223,7 +223,7 @@ func (g *genInst) scanForGenCalls(decl ir.Node) {
 
 			// Transform the Call now, which changes OCALL
 			// to OCALLFUNC and does typecheckaste/assignconvfn.
-			transformCall(call, nil)
+			transformCall(call)
 
 			st := g.getInstantiation(gf, targs, true).fun
 			dictValue, usingSubdict := g.getDictOrSubdict(declInfo, n, gf, targs, true)
@@ -500,7 +500,7 @@ func (g *genInst) buildClosure(outer *ir.Func, x ir.Node) ir.Node {
 			// explicitly traverse any embedded fields in the receiver
 			// argument in order to call the method instantiation.
 			arg0 := formalParams[0].Nname.(ir.Node)
-			arg0 = typecheck.AddImplicitDots(ir.NewSelectorExpr(base.Pos, ir.OXDOT, arg0, x.(*ir.SelectorExpr).Sel)).X
+			arg0 = typecheck.AddImplicitDots(ir.NewSelectorExpr(x.Pos(), ir.OXDOT, arg0, x.(*ir.SelectorExpr).Sel)).X
 			if valueMethod && arg0.Type().IsPtr() {
 				// For handling the (*T).M case: if we have a pointer
 				// receiver after following all the embedded fields,
@@ -515,6 +515,7 @@ func (g *genInst) buildClosure(outer *ir.Func, x ir.Node) ir.Node {
 
 	// Build call itself.
 	var innerCall ir.Node = ir.NewCallExpr(pos, ir.OCALL, target.Nname, args)
+	innerCall.(*ir.CallExpr).IsDDD = typ.IsVariadic()
 	if len(formalResults) > 0 {
 		innerCall = ir.NewReturnStmt(pos, []ir.Node{innerCall})
 	}
@@ -615,7 +616,7 @@ func (g *genInst) getDictOrSubdict(declInfo *instInfo, n ir.Node, nameNode *ir.N
 		}
 	}
 	if !usingSubdict {
-		dict = g.getDictionaryValue(nameNode, targs, isMeth)
+		dict = g.getDictionaryValue(n.Pos(), nameNode, targs, isMeth)
 	}
 	return dict, usingSubdict
 }
@@ -624,7 +625,7 @@ func (g *genInst) getDictOrSubdict(declInfo *instInfo, n ir.Node, nameNode *ir.N
 // yet. If so, it imports the body.
 func checkFetchBody(nameNode *ir.Name) {
 	if nameNode.Func.Body == nil && nameNode.Func.Inl != nil {
-		// If there is no body yet but Func.Inl exists, then we can can
+		// If there is no body yet but Func.Inl exists, then we can
 		// import the whole generic body.
 		assert(nameNode.Func.Inl.Cost == 1 && nameNode.Sym().Pkg != types.LocalPkg)
 		typecheck.ImportBody(nameNode.Func)
@@ -638,7 +639,18 @@ func checkFetchBody(nameNode *ir.Name) {
 // with the type arguments shapes. If the instantiated function is not already
 // cached, then it calls genericSubst to create the new instantiation.
 func (g *genInst) getInstantiation(nameNode *ir.Name, shapes []*types.Type, isMeth bool) *instInfo {
-	checkFetchBody(nameNode)
+	if nameNode.Func == nil {
+		// If nameNode.Func is nil, this must be a reference to a method of
+		// an imported instantiated type. We will have already called
+		// g.instantiateMethods() on the fully-instantiated type, so
+		// g.instInfoMap[sym] will be non-nil below.
+		rcvr := nameNode.Type().Recv()
+		if rcvr == nil || !deref(rcvr.Type).IsFullyInstantiated() {
+			base.FatalfAt(nameNode.Pos(), "Unexpected function instantiation %v with no body", nameNode)
+		}
+	} else {
+		checkFetchBody(nameNode)
+	}
 
 	// Convert any non-shape type arguments to their shape, so we can reduce the
 	// number of instantiations we have to generate. You can actually have a mix
@@ -790,11 +802,12 @@ func (g *genInst) genericSubst(newsym *types.Sym, nameNode *ir.Name, shapes []*t
 
 	// Make sure name/type of newf is set before substituting the body.
 	newf.Body = subst.list(gf.Body)
-
-	// Add code to check that the dictionary is correct.
-	// TODO: must be adjusted to deal with shapes, but will go away soon when we move
-	// to many->1 shape to concrete mapping.
-	// newf.Body.Prepend(subst.checkDictionary(dictionaryName, shapes)...)
+	if len(newf.Body) == 0 {
+		// Ensure the body is nonempty, for issue 49524.
+		// TODO: have some other way to detect the difference between
+		// a function declared with no body, vs. one with an empty body?
+		newf.Body = append(newf.Body, ir.NewBlockStmt(gf.Pos(), nil))
+	}
 
 	if len(subst.defnMap) > 0 {
 		base.Fatalf("defnMap is not empty")
@@ -848,49 +861,6 @@ func (subst *subster) localvar(name *ir.Name) *ir.Name {
 	return m
 }
 
-// checkDictionary returns code that does runtime consistency checks
-// between the dictionary and the types it should contain.
-func (subst *subster) checkDictionary(name *ir.Name, targs []*types.Type) (code []ir.Node) {
-	if false {
-		return // checking turned off
-	}
-	// TODO: when moving to GCshape, this test will become harder. Call into
-	// runtime to check the expected shape is correct?
-	pos := name.Pos()
-	// Convert dictionary to *[N]uintptr
-	d := ir.NewConvExpr(pos, ir.OCONVNOP, types.Types[types.TUNSAFEPTR], name)
-	d.SetTypecheck(1)
-	d = ir.NewConvExpr(pos, ir.OCONVNOP, types.NewArray(types.Types[types.TUINTPTR], int64(len(targs))).PtrTo(), d)
-	d.SetTypecheck(1)
-	types.CheckSize(d.Type().Elem())
-
-	// Check that each type entry in the dictionary is correct.
-	for i, t := range targs {
-		if t.HasShape() {
-			// Check the concrete type, not the shape type.
-			base.Fatalf("shape type in dictionary %s %+v\n", name.Sym().Name, t)
-		}
-		want := reflectdata.TypePtr(t)
-		typed(types.Types[types.TUINTPTR], want)
-		deref := ir.NewStarExpr(pos, d)
-		typed(d.Type().Elem(), deref)
-		idx := ir.NewConstExpr(constant.MakeUint64(uint64(i)), name) // TODO: what to set orig to?
-		typed(types.Types[types.TUINTPTR], idx)
-		got := ir.NewIndexExpr(pos, deref, idx)
-		typed(types.Types[types.TUINTPTR], got)
-		cond := ir.NewBinaryExpr(pos, ir.ONE, want, got)
-		typed(types.Types[types.TBOOL], cond)
-		panicArg := ir.NewNilExpr(pos)
-		typed(types.NewInterface(types.LocalPkg, nil), panicArg)
-		then := ir.NewUnaryExpr(pos, ir.OPANIC, panicArg)
-		then.SetTypecheck(1)
-		x := ir.NewIfStmt(pos, cond, []ir.Node{then}, nil)
-		x.SetTypecheck(1)
-		code = append(code, x)
-	}
-	return
-}
-
 // getDictionaryEntry gets the i'th entry in the dictionary dict.
 func getDictionaryEntry(pos src.XPos, dict *ir.Name, i int, size int) ir.Node {
 	// Convert dictionary to *[N]uintptr
@@ -928,12 +898,17 @@ func getDictionaryType(info *instInfo, dictParam *ir.Name, pos src.XPos, i int) 
 }
 
 // node is like DeepCopy(), but substitutes ONAME nodes based on subst.ts.vars, and
-// also descends into closures. It substitutes type arguments for type parameters
-// in all the new nodes.
+// also descends into closures. It substitutes type arguments for type parameters in
+// all the new nodes and does the transformations that were delayed on the generic
+// function.
 func (subst *subster) node(n ir.Node) ir.Node {
 	// Use closure to capture all state needed by the ir.EditChildren argument.
 	var edit func(ir.Node) ir.Node
 	edit = func(x ir.Node) ir.Node {
+		// Analogous to ir.SetPos() at beginning of typecheck.typecheck() -
+		// allows using base.Pos during the transform functions, just like
+		// the tc*() functions.
+		ir.SetPos(x)
 		switch x.Op() {
 		case ir.OTYPE:
 			return ir.TypeNode(subst.ts.Typ(x.Type()))
@@ -973,15 +948,15 @@ func (subst *subster) node(n ir.Node) ir.Node {
 		if _, isExpr := m.(ir.Expr); isExpr {
 			t := x.Type()
 			if t == nil {
-				// t can be nil only if this is a call that has no
-				// return values, so allow that and otherwise give
-				// an error.
+				// Check for known cases where t can be nil (call
+				// that has no return values, and key expressions)
+				// and otherwise cause a fatal error.
 				_, isCallExpr := m.(*ir.CallExpr)
 				_, isStructKeyExpr := m.(*ir.StructKeyExpr)
 				_, isKeyExpr := m.(*ir.KeyExpr)
 				if !isCallExpr && !isStructKeyExpr && !isKeyExpr && x.Op() != ir.OPANIC &&
 					x.Op() != ir.OCLOSE {
-					base.Fatalf(fmt.Sprintf("Nil type for %v", x))
+					base.FatalfAt(m.Pos(), "Nil type for %v", x)
 				}
 			} else if x.Op() != ir.OCLOSURE {
 				m.SetType(subst.ts.Typ(x.Type()))
@@ -991,56 +966,55 @@ func (subst *subster) node(n ir.Node) ir.Node {
 		ir.EditChildren(m, edit)
 
 		m.SetTypecheck(1)
-		if x.Op().IsCmp() {
-			transformCompare(m.(*ir.BinaryExpr))
-		} else {
-			switch x.Op() {
-			case ir.OSLICE, ir.OSLICE3:
-				transformSlice(m.(*ir.SliceExpr))
 
-			case ir.OADD:
-				m = transformAdd(m.(*ir.BinaryExpr))
-
-			case ir.OINDEX:
-				transformIndex(m.(*ir.IndexExpr))
-
-			case ir.OAS2:
-				as2 := m.(*ir.AssignListStmt)
-				transformAssign(as2, as2.Lhs, as2.Rhs)
-
-			case ir.OAS:
-				as := m.(*ir.AssignStmt)
-				if as.Y != nil {
-					// transformAssign doesn't handle the case
-					// of zeroing assignment of a dcl (rhs[0] is nil).
-					lhs, rhs := []ir.Node{as.X}, []ir.Node{as.Y}
-					transformAssign(as, lhs, rhs)
-					as.X, as.Y = lhs[0], rhs[0]
-				}
-
-			case ir.OASOP:
-				as := m.(*ir.AssignOpStmt)
-				transformCheckAssign(as, as.X)
-
-			case ir.ORETURN:
-				transformReturn(m.(*ir.ReturnStmt))
-
-			case ir.OSEND:
-				transformSend(m.(*ir.SendStmt))
-
-			case ir.OSELECT:
-				transformSelect(m.(*ir.SelectStmt))
-
-			case ir.OCOMPLIT:
-				transformCompLit(m.(*ir.CompLitExpr))
-
-			case ir.OADDR:
-				transformAddr(m.(*ir.AddrExpr))
-
-			}
-		}
-
+		// Do the transformations that we delayed on the generic function
+		// node, now that we have substituted in the type args.
 		switch x.Op() {
+		case ir.OEQ, ir.ONE, ir.OLT, ir.OLE, ir.OGT, ir.OGE:
+			transformCompare(m.(*ir.BinaryExpr))
+
+		case ir.OSLICE, ir.OSLICE3:
+			transformSlice(m.(*ir.SliceExpr))
+
+		case ir.OADD:
+			m = transformAdd(m.(*ir.BinaryExpr))
+
+		case ir.OINDEX:
+			transformIndex(m.(*ir.IndexExpr))
+
+		case ir.OAS2:
+			as2 := m.(*ir.AssignListStmt)
+			transformAssign(as2, as2.Lhs, as2.Rhs)
+
+		case ir.OAS:
+			as := m.(*ir.AssignStmt)
+			if as.Y != nil {
+				// transformAssign doesn't handle the case
+				// of zeroing assignment of a dcl (rhs[0] is nil).
+				lhs, rhs := []ir.Node{as.X}, []ir.Node{as.Y}
+				transformAssign(as, lhs, rhs)
+				as.X, as.Y = lhs[0], rhs[0]
+			}
+
+		case ir.OASOP:
+			as := m.(*ir.AssignOpStmt)
+			transformCheckAssign(as, as.X)
+
+		case ir.ORETURN:
+			transformReturn(m.(*ir.ReturnStmt))
+
+		case ir.OSEND:
+			transformSend(m.(*ir.SendStmt))
+
+		case ir.OSELECT:
+			transformSelect(m.(*ir.SelectStmt))
+
+		case ir.OCOMPLIT:
+			transformCompLit(m.(*ir.CompLitExpr))
+
+		case ir.OADDR:
+			transformAddr(m.(*ir.AddrExpr))
+
 		case ir.OLITERAL:
 			t := m.Type()
 			if t != x.Type() {
@@ -1058,16 +1032,13 @@ func (subst *subster) node(n ir.Node) ir.Node {
 			}
 
 		case ir.OXDOT:
-			// A method value/call via a type param will have been
-			// left as an OXDOT. When we see this during stenciling,
-			// finish the transformation, now that we have the
-			// instantiated receiver type. We need to do this now,
-			// since the access/selection to the method for the real
-			// type is very different from the selection for the type
-			// param. m will be transformed to an OMETHVALUE node. It
-			// will be transformed to an ODOTMETH or ODOTINTER node if
-			// we find in the OCALL case below that the method value
-			// is actually called.
+			// Finish the transformation of an OXDOT, unless this was a
+			// bound call (a direct call on a type param). A bound call
+			// will be transformed during the dictPass. Otherwise, m
+			// will be transformed to an OMETHVALUE node. It will be
+			// transformed to an ODOTMETH or ODOTINTER node if we find in
+			// the OCALL case below that the method value is actually
+			// called.
 			mse := m.(*ir.SelectorExpr)
 			if src := mse.X.Type(); !src.IsShape() {
 				transformDot(mse, false)
@@ -1080,7 +1051,7 @@ func (subst *subster) node(n ir.Node) ir.Node {
 				// Transform the conversion, now that we know the
 				// type argument.
 				m = transformConvCall(call)
-				// CONVIFACE transformation was already done in node2
+				// CONVIFACE transformation was already done in noder2
 				assert(m.Op() != ir.OCONVIFACE)
 
 			case ir.OMETHVALUE, ir.OMETHEXPR:
@@ -1089,14 +1060,14 @@ func (subst *subster) node(n ir.Node) ir.Node {
 				// transform the call.
 				call.X.(*ir.SelectorExpr).SetOp(ir.OXDOT)
 				transformDot(call.X.(*ir.SelectorExpr), true)
-				transformCall(call, subst.info.dictParam)
+				transformCall(call)
 
 			case ir.ODOT, ir.ODOTPTR:
 				// An OXDOT for a generic receiver was resolved to
 				// an access to a field which has a function
 				// value. Transform the call to that function, now
 				// that the OXDOT was resolved.
-				transformCall(call, subst.info.dictParam)
+				transformCall(call)
 
 			case ir.ONAME:
 				name := call.X.Name()
@@ -1113,24 +1084,8 @@ func (subst *subster) node(n ir.Node) ir.Node {
 					// This is the case of a function value that was a
 					// type parameter (implied to be a function via a
 					// structural constraint) which is now resolved.
-					transformCall(call, subst.info.dictParam)
+					transformCall(call)
 				}
-
-			case ir.OCLOSURE:
-				transformCall(call, subst.info.dictParam)
-
-			case ir.ODEREF, ir.OINDEX, ir.OINDEXMAP, ir.ORECV:
-				// Transform a call that was delayed because of the
-				// use of typeparam inside an expression that required
-				// a pointer dereference, array indexing, map indexing,
-				// or channel receive to compute function value.
-				transformCall(call, subst.info.dictParam)
-
-			case ir.OCALL, ir.OCALLFUNC, ir.OCALLMETH, ir.OCALLINTER:
-				transformCall(call, subst.info.dictParam)
-
-			case ir.OCONVNOP:
-				transformCall(call, subst.info.dictParam)
 
 			case ir.OFUNCINST:
 				// A call with an OFUNCINST will get transformed
@@ -1138,12 +1093,26 @@ func (subst *subster) node(n ir.Node) ir.Node {
 				// instantiation to be called.
 				// We must transform the arguments of the call now, though,
 				// so that any needed CONVIFACE nodes are exposed,
-				// so the dictionary format is correct
+				// so the dictionary format is correct.
 				transformEarlyCall(call)
 
-			case ir.OXDOT, ir.ODOTTYPE, ir.ODOTTYPE2:
+			case ir.OXDOT:
+				// This is the case of a bound call on a typeparam,
+				// which will be handled in the dictPass.
+				// As with OFUNCINST, we must transform the arguments of the call now,
+				// so any needed CONVIFACE nodes are exposed.
+				transformEarlyCall(call)
+
+			case ir.ODOTTYPE, ir.ODOTTYPE2:
+				// These are DOTTYPEs that could get transformed into
+				// ODYNAMIC DOTTYPEs by the dict pass.
+
 			default:
-				base.FatalfAt(call.Pos(), fmt.Sprintf("Unexpected op with CALL during stenciling: %v", call.X.Op()))
+				// Transform a call for all other values of
+				// call.X.Op() that don't require any special
+				// handling.
+				transformCall(call)
+
 			}
 
 		case ir.OCLOSURE:
@@ -1267,17 +1236,15 @@ func (g *genInst) dictPass(info *instInfo) {
 				transformDot(mse, false)
 			}
 		case ir.OCALL:
-			op := m.(*ir.CallExpr).X.Op()
-			if op != ir.OFUNCINST {
-				assert(op == ir.OMETHVALUE || op == ir.OCLOSURE || op == ir.ODYNAMICDOTTYPE || op == ir.ODYNAMICDOTTYPE2)
-				if op == ir.OMETHVALUE {
-					// Redo the transformation of OXDOT, now that we
-					// know the method value is being called.
-					m.(*ir.CallExpr).X.(*ir.SelectorExpr).SetOp(ir.OXDOT)
-					transformDot(m.(*ir.CallExpr).X.(*ir.SelectorExpr), true)
-				}
-				transformCall(m.(*ir.CallExpr), info.dictParam)
+			call := m.(*ir.CallExpr)
+			op := call.X.Op()
+			if op == ir.OMETHVALUE {
+				// Redo the transformation of OXDOT, now that we
+				// know the method value is being called.
+				call.X.(*ir.SelectorExpr).SetOp(ir.OXDOT)
+				transformDot(call.X.(*ir.SelectorExpr), true)
 			}
+			transformCall(call)
 
 		case ir.OCONVIFACE:
 			if m.Type().IsEmptyInterface() && m.(*ir.ConvExpr).X.Type().IsEmptyInterface() {
@@ -1523,18 +1490,12 @@ func deref(t *types.Type) *types.Type {
 // needed methods.
 func markTypeUsed(t *types.Type, lsym *obj.LSym) {
 	if t.IsInterface() {
-		// Mark all the methods of the interface as used.
-		// TODO: we should really only mark the interface methods
-		// that are actually called in the application.
-		for i, _ := range t.AllMethods().Slice() {
-			reflectdata.MarkUsedIfaceMethodIndex(lsym, t, i)
-		}
-	} else {
-		// TODO: This is somewhat overkill, we really only need it
-		// for types that are put into interfaces.
-		// Note: this relocation is also used in cmd/link/internal/ld/dwarf.go
-		reflectdata.MarkTypeUsedInInterface(t, lsym)
+		return
 	}
+	// TODO: This is somewhat overkill, we really only need it
+	// for types that are put into interfaces.
+	// Note: this relocation is also used in cmd/link/internal/ld/dwarf.go
+	reflectdata.MarkTypeUsedInInterface(t, lsym)
 }
 
 // getDictionarySym returns the dictionary for the named generic function gf, which
@@ -1598,9 +1559,9 @@ func (g *genInst) getDictionarySym(gf *ir.Name, targs []*types.Type, isMeth bool
 				if se.X.Type().IsShape() {
 					// This is a method call enabled by a type bound.
 
-					// We need this extra check for type expressions, which
-					// don't add in the implicit XDOTs.
-					tmpse := ir.NewSelectorExpr(base.Pos, ir.OXDOT, se.X, se.Sel)
+					// We need this extra check for method expressions,
+					// which don't add in the implicit XDOTs.
+					tmpse := ir.NewSelectorExpr(src.NoXPos, ir.OXDOT, se.X, se.Sel)
 					tmpse = typecheck.AddImplicitDots(tmpse)
 					tparam := tmpse.X.Type()
 					if !tparam.IsShape() {
@@ -1735,18 +1696,6 @@ func (g *genInst) finalizeSyms() {
 				se := n.(*ir.SelectorExpr)
 				srctype = subst.Typ(se.X.Type())
 				dsttype = subst.Typ(info.shapeToBound[se.X.Type()])
-				found := false
-				for i, m := range dsttype.AllMethods().Slice() {
-					if se.Sel == m.Sym {
-						// Mark that this method se.Sel is
-						// used for the dsttype interface, so
-						// it won't get deadcoded.
-						reflectdata.MarkUsedIfaceMethodIndex(lsym, dsttype, i)
-						found = true
-						break
-					}
-				}
-				assert(found)
 			case ir.ODOTTYPE, ir.ODOTTYPE2:
 				srctype = subst.Typ(n.(*ir.TypeAssertExpr).Type())
 				dsttype = subst.Typ(n.(*ir.TypeAssertExpr).X.Type())
@@ -1780,7 +1729,7 @@ func (g *genInst) finalizeSyms() {
 	g.dictSymsToFinalize = nil
 }
 
-func (g *genInst) getDictionaryValue(gf *ir.Name, targs []*types.Type, isMeth bool) ir.Node {
+func (g *genInst) getDictionaryValue(pos src.XPos, gf *ir.Name, targs []*types.Type, isMeth bool) ir.Node {
 	sym := g.getDictionarySym(gf, targs, isMeth)
 
 	// Make (or reuse) a node referencing the dictionary symbol.
@@ -1788,15 +1737,18 @@ func (g *genInst) getDictionaryValue(gf *ir.Name, targs []*types.Type, isMeth bo
 	if sym.Def != nil {
 		n = sym.Def.(*ir.Name)
 	} else {
-		n = typecheck.NewName(sym)
+		// We set the position of a static dictionary to be the position of
+		// one of its uses.
+		n = ir.NewNameAt(pos, sym)
+		n.Curfn = ir.CurFunc
 		n.SetType(types.Types[types.TUINTPTR]) // should probably be [...]uintptr, but doesn't really matter
 		n.SetTypecheck(1)
 		n.Class = ir.PEXTERN
 		sym.Def = n
 	}
 
-	// Return the address of the dictionary.
-	np := typecheck.NodAddr(n)
+	// Return the address of the dictionary.  Addr node gets position that was passed in.
+	np := typecheck.NodAddrAt(pos, n)
 	// Note: treat dictionary pointers as uintptrs, so they aren't pointers
 	// with respect to GC. That saves on stack scanning work, write barriers, etc.
 	// We can get away with it because dictionaries are global variables.
@@ -2103,6 +2055,7 @@ func startClosure(pos src.XPos, outer *ir.Func, typ *types.Type) (*ir.Func, []*t
 		fn.Dcl = append(fn.Dcl, arg)
 		f := types.NewField(pos, arg.Sym(), t)
 		f.Nname = arg
+		f.SetIsDDD(typ.Params().Field(i).IsDDD())
 		formalParams = append(formalParams, f)
 	}
 	for i := 0; i < typ.NumResults(); i++ {

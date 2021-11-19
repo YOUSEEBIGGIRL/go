@@ -5,6 +5,7 @@
 package reflect
 
 import (
+	"errors"
 	"internal/abi"
 	"internal/goarch"
 	"internal/itoa"
@@ -90,8 +91,8 @@ func (f flag) ro() flag {
 }
 
 // pointer returns the underlying pointer represented by v.
-// v.Kind() must be Ptr, Map, Chan, Func, or UnsafePointer
-// if v.Kind() == Ptr, the base type must not be go:notinheap.
+// v.Kind() must be Pointer, Map, Chan, Func, or UnsafePointer
+// if v.Kind() == Pointer, the base type must not be go:notinheap.
 func (v Value) pointer() unsafe.Pointer {
 	if v.typ.size != goarch.PtrSize || !v.typ.pointers() {
 		panic("can't call pointer on a non-pointer Value")
@@ -274,7 +275,7 @@ func (v Value) Addr() Value {
 	// Preserve flagRO instead of using v.flag.ro() so that
 	// v.Addr().Elem() is equivalent to v (#32772)
 	fl := v.flag & flagRO
-	return Value{v.typ.ptrTo(), v.ptr, fl | flag(Ptr)}
+	return Value{v.typ.ptrTo(), v.ptr, fl | flag(Pointer)}
 }
 
 // Bool returns v's underlying value.
@@ -351,7 +352,7 @@ func (v Value) CallSlice(in []Value) []Value {
 	return v.call("CallSlice", in)
 }
 
-var callGC bool // for testing; see TestCallMethodJump
+var callGC bool // for testing; see TestCallMethodJump and TestCallArgLive
 
 const debugReflectCall = false
 
@@ -508,12 +509,16 @@ func (v Value) call(op string, in []Value) []Value {
 				// Copy values to "integer registers."
 				if v.flag&flagIndir != 0 {
 					offset := add(v.ptr, st.offset, "precomputed value offset")
-					intToReg(&regArgs, st.ireg, st.size, offset)
-				} else {
 					if st.kind == abiStepPointer {
 						// Duplicate this pointer in the pointer area of the
 						// register space. Otherwise, there's the potential for
 						// this to be the last reference to v.ptr.
+						regArgs.Ptrs[st.ireg] = *(*unsafe.Pointer)(offset)
+					}
+					intToReg(&regArgs, st.ireg, st.size, offset)
+				} else {
+					if st.kind == abiStepPointer {
+						// See the comment in abiStepPointer case above.
 						regArgs.Ptrs[st.ireg] = v.ptr
 					}
 					regArgs.Ints[st.ireg] = uintptr(v.ptr)
@@ -537,6 +542,15 @@ func (v Value) call(op string, in []Value) []Value {
 
 	// Mark pointers in registers for the return path.
 	regArgs.ReturnIsPtr = abi.outRegPtrs
+
+	if debugReflectCall {
+		regArgs.Dump()
+	}
+
+	// For testing; see TestCallArgLive.
+	if callGC {
+		runtime.GC()
+	}
 
 	// Call.
 	call(frametype, fn, stackArgs, uint32(frametype.size), uint32(abi.retOffset), uint32(frameSize), &regArgs)
@@ -1147,7 +1161,7 @@ func (v Value) Complex() complex128 {
 
 // Elem returns the value that the interface v contains
 // or that the pointer v points to.
-// It panics if v's Kind is not Interface or Ptr.
+// It panics if v's Kind is not Interface or Pointer.
 // It returns the zero Value if v is nil.
 func (v Value) Elem() Value {
 	k := v.kind()
@@ -1166,7 +1180,7 @@ func (v Value) Elem() Value {
 			x.flag |= v.flag.ro()
 		}
 		return x
-	case Ptr:
+	case Pointer:
 		ptr := v.ptr
 		if v.flag&flagIndir != 0 {
 			if ifaceIndir(v.typ) {
@@ -1232,7 +1246,8 @@ func (v Value) Field(i int) Value {
 }
 
 // FieldByIndex returns the nested field corresponding to index.
-// It panics if v's Kind is not struct.
+// It panics if evaluation requires stepping through a nil
+// pointer or a field that is not a struct.
 func (v Value) FieldByIndex(index []int) Value {
 	if len(index) == 1 {
 		return v.Field(index[0])
@@ -1240,7 +1255,7 @@ func (v Value) FieldByIndex(index []int) Value {
 	v.mustBe(Struct)
 	for i, x := range index {
 		if i > 0 {
-			if v.Kind() == Ptr && v.typ.Elem().Kind() == Struct {
+			if v.Kind() == Pointer && v.typ.Elem().Kind() == Struct {
 				if v.IsNil() {
 					panic("reflect: indirection through nil pointer to embedded struct")
 				}
@@ -1250,6 +1265,29 @@ func (v Value) FieldByIndex(index []int) Value {
 		v = v.Field(x)
 	}
 	return v
+}
+
+// FieldByIndexErr returns the nested field corresponding to index.
+// It returns an error if evaluation requires stepping through a nil
+// pointer, but panics if it must step through a field that
+// is not a struct.
+func (v Value) FieldByIndexErr(index []int) (Value, error) {
+	if len(index) == 1 {
+		return v.Field(index[0]), nil
+	}
+	v.mustBe(Struct)
+	for i, x := range index {
+		if i > 0 {
+			if v.Kind() == Ptr && v.typ.Elem().Kind() == Struct {
+				if v.IsNil() {
+					return Value{}, errors.New("reflect: indirection through nil pointer to embedded struct field " + v.typ.Elem().Name())
+				}
+				v = v.Elem()
+			}
+		}
+		v = v.Field(x)
+	}
+	return v, nil
 }
 
 // FieldByName returns the struct field with the given name.
@@ -1321,7 +1359,7 @@ func (v Value) Index(i int) Value {
 		return Value{typ, val, fl}
 
 	case Slice:
-		// Element flag same as Elem of Ptr.
+		// Element flag same as Elem of Pointer.
 		// Addressable, indirect, possibly read-only.
 		s := (*unsafeheader.Slice)(v.ptr)
 		if uint(i) >= uint(s.Len) {
@@ -1451,7 +1489,7 @@ func (v Value) InterfaceData() [2]uintptr {
 func (v Value) IsNil() bool {
 	k := v.kind()
 	switch k {
-	case Chan, Func, Map, Ptr, UnsafePointer:
+	case Chan, Func, Map, Pointer, UnsafePointer:
 		if v.flag&flagMethod != 0 {
 			return false
 		}
@@ -1499,7 +1537,7 @@ func (v Value) IsZero() bool {
 			}
 		}
 		return true
-	case Chan, Func, Interface, Map, Ptr, Slice, UnsafePointer:
+	case Chan, Func, Interface, Map, Pointer, Slice, UnsafePointer:
 		return v.IsNil()
 	case String:
 		return v.Len() == 0
@@ -1640,7 +1678,7 @@ type hiter struct {
 	checkBucket uintptr
 }
 
-func (h hiter) initialized() bool {
+func (h *hiter) initialized() bool {
 	return h.t != nil
 }
 
@@ -1923,7 +1961,7 @@ func (v Value) OverflowUint(x uint64) bool {
 // It returns uintptr instead of unsafe.Pointer so that
 // code using reflect cannot obtain unsafe.Pointers
 // without importing the unsafe package explicitly.
-// It panics if v's Kind is not Chan, Func, Map, Ptr, Slice, or UnsafePointer.
+// It panics if v's Kind is not Chan, Func, Map, Pointer, Slice, or UnsafePointer.
 //
 // If v's Kind is Func, the returned pointer is an underlying
 // code pointer, but not necessarily enough to identify a
@@ -1933,17 +1971,20 @@ func (v Value) OverflowUint(x uint64) bool {
 // If v's Kind is Slice, the returned pointer is to the first
 // element of the slice. If the slice is nil the returned value
 // is 0.  If the slice is empty but non-nil the return value is non-zero.
+//
+// It's preferred to use uintptr(Value.UnsafePointer()) to get the equivalent result.
 func (v Value) Pointer() uintptr {
-	// TODO: deprecate
 	k := v.kind()
 	switch k {
-	case Ptr:
+	case Pointer:
 		if v.typ.ptrdata == 0 {
-			// Handle pointers to go:notinheap types directly,
-			// so we never materialize such pointers as an
-			// unsafe.Pointer. (Such pointers are always indirect.)
-			// See issue 42076.
-			return *(*uintptr)(v.ptr)
+			val := *(*uintptr)(v.ptr)
+			// Since it is a not-in-heap pointer, all pointers to the heap are
+			// forbidden! See comment in Value.Elem and issue #48399.
+			if !verifyNotInHeapPtr(val) {
+				panic("reflect: reflect.Value.Pointer on an invalid notinheap pointer")
+			}
+			return val
 		}
 		fallthrough
 	case Chan, Map, UnsafePointer:
@@ -1956,8 +1997,7 @@ func (v Value) Pointer() uintptr {
 			// created via reflect have the same underlying code pointer,
 			// so their Pointers are equal. The function used here must
 			// match the one used in makeMethodValue.
-			f := methodValueCall
-			return **(**uintptr)(unsafe.Pointer(&f))
+			return methodValueCallCodePtr()
 		}
 		p := v.pointer()
 		// Non-nil func value points at data block.
@@ -2473,11 +2513,12 @@ func (v Value) Uint() uint64 {
 // which ensures cmd/compile can recognize unsafe.Pointer(v.UnsafeAddr())
 // and make an exception.
 
-// UnsafeAddr returns a pointer to v's data.
+// UnsafeAddr returns a pointer to v's data, as a uintptr.
 // It is for advanced clients that also import the "unsafe" package.
 // It panics if v is not addressable.
+//
+// It's preferred to use uintptr(Value.Addr().UnsafePointer()) to get the equivalent result.
 func (v Value) UnsafeAddr() uintptr {
-	// TODO: deprecate
 	if v.typ == nil {
 		panic(&ValueError{"reflect.Value.UnsafeAddr", Invalid})
 	}
@@ -2485,6 +2526,57 @@ func (v Value) UnsafeAddr() uintptr {
 		panic("reflect.Value.UnsafeAddr of unaddressable value")
 	}
 	return uintptr(v.ptr)
+}
+
+// UnsafePointer returns v's value as a unsafe.Pointer.
+// It panics if v's Kind is not Chan, Func, Map, Pointer, Slice, or UnsafePointer.
+//
+// If v's Kind is Func, the returned pointer is an underlying
+// code pointer, but not necessarily enough to identify a
+// single function uniquely. The only guarantee is that the
+// result is zero if and only if v is a nil func Value.
+//
+// If v's Kind is Slice, the returned pointer is to the first
+// element of the slice. If the slice is nil the returned value
+// is nil.  If the slice is empty but non-nil the return value is non-nil.
+func (v Value) UnsafePointer() unsafe.Pointer {
+	k := v.kind()
+	switch k {
+	case Pointer:
+		if v.typ.ptrdata == 0 {
+			// Since it is a not-in-heap pointer, all pointers to the heap are
+			// forbidden! See comment in Value.Elem and issue #48399.
+			if !verifyNotInHeapPtr(*(*uintptr)(v.ptr)) {
+				panic("reflect: reflect.Value.UnsafePointer on an invalid notinheap pointer")
+			}
+			return *(*unsafe.Pointer)(v.ptr)
+		}
+		fallthrough
+	case Chan, Map, UnsafePointer:
+		return v.pointer()
+	case Func:
+		if v.flag&flagMethod != 0 {
+			// As the doc comment says, the returned pointer is an
+			// underlying code pointer but not necessarily enough to
+			// identify a single function uniquely. All method expressions
+			// created via reflect have the same underlying code pointer,
+			// so their Pointers are equal. The function used here must
+			// match the one used in makeMethodValue.
+			code := methodValueCallCodePtr()
+			return *(*unsafe.Pointer)(unsafe.Pointer(&code))
+		}
+		p := v.pointer()
+		// Non-nil func value points at data block.
+		// First word of data block is actual code.
+		if p != nil {
+			p = *(*unsafe.Pointer)(p)
+		}
+		return p
+
+	case Slice:
+		return (*unsafeheader.Slice)(v.ptr).Data
+	}
+	panic(&ValueError{"reflect.Value.UnsafePointer", v.kind()})
 }
 
 // StringHeader is the runtime representation of a string.
@@ -2854,7 +2946,7 @@ func MakeMapWithSize(typ Type, n int) Value {
 // If v is a nil pointer, Indirect returns a zero Value.
 // If v is not a pointer, Indirect returns v.
 func Indirect(v Value) Value {
-	if v.Kind() != Ptr {
+	if v.Kind() != Pointer {
 		return v
 	}
 	return v.Elem()
@@ -2906,7 +2998,7 @@ const maxZero = 1024
 var zeroVal [maxZero]byte
 
 // New returns a Value representing a pointer to a new zero value
-// for the specified type. That is, the returned Value's Type is PtrTo(typ).
+// for the specified type. That is, the returned Value's Type is PointerTo(typ).
 func New(typ Type) Value {
 	if typ == nil {
 		panic("reflect: New(nil)")
@@ -2918,14 +3010,14 @@ func New(typ Type) Value {
 		panic("reflect: New of type that may not be allocated in heap (possibly undefined cgo C type)")
 	}
 	ptr := unsafe_New(t)
-	fl := flag(Ptr)
+	fl := flag(Pointer)
 	return Value{pt, ptr, fl}
 }
 
 // NewAt returns a Value representing a pointer to a value of the
 // specified type, using p as that pointer.
 func NewAt(typ Type, p unsafe.Pointer) Value {
-	fl := flag(Ptr)
+	fl := flag(Pointer)
 	t := typ.(*rtype)
 	return Value{t.ptrTo(), p, fl}
 }
@@ -2994,7 +3086,7 @@ func (v Value) CanConvert(t Type) bool {
 	// Currently the only conversion that is OK in terms of type
 	// but that can panic depending on the value is converting
 	// from slice to pointer-to-array.
-	if vt.Kind() == Slice && t.Kind() == Ptr && t.Elem().Kind() == Array {
+	if vt.Kind() == Slice && t.Kind() == Pointer && t.Elem().Kind() == Array {
 		n := t.Elem().Len()
 		if n > v.Len() {
 			return false
@@ -3064,7 +3156,7 @@ func convertOp(dst, src *rtype) func(Value, Type) Value {
 		}
 		// "x is a slice, T is a pointer-to-array type,
 		// and the slice and array types have identical element types."
-		if dst.Kind() == Ptr && dst.Elem().Kind() == Array && src.Elem() == dst.Elem().Elem() {
+		if dst.Kind() == Pointer && dst.Elem().Kind() == Array && src.Elem() == dst.Elem().Elem() {
 			return cvtSliceArrayPtr
 		}
 
@@ -3080,8 +3172,8 @@ func convertOp(dst, src *rtype) func(Value, Type) Value {
 	}
 
 	// dst and src are non-defined pointer types with same underlying base type.
-	if dst.Kind() == Ptr && dst.Name() == "" &&
-		src.Kind() == Ptr && src.Name() == "" &&
+	if dst.Kind() == Pointer && dst.Name() == "" &&
+		src.Kind() == Pointer && src.Name() == "" &&
 		haveIdenticalUnderlyingType(dst.Elem().common(), src.Elem().common(), false) {
 		return cvtDirect
 	}
@@ -3267,7 +3359,7 @@ func cvtSliceArrayPtr(v Value, t Type) Value {
 		panic("reflect: cannot convert slice with length " + itoa.Itoa(v.Len()) + " to pointer to array with length " + itoa.Itoa(n))
 	}
 	h := (*unsafeheader.Slice)(v.ptr)
-	return Value{t.common(), h.Data, v.flag&^(flagIndir|flagAddr|flagKindMask) | flag(Ptr)}
+	return Value{t.common(), h.Data, v.flag&^(flagIndir|flagAddr|flagKindMask) | flag(Pointer)}
 }
 
 // convertOp: direct copy

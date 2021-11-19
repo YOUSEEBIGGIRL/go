@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 
 //go:build cgo
-// +build cgo
 
 package runtime_test
 
@@ -303,12 +302,7 @@ func testCgoPprof(t *testing.T, buildArg, runArg, top, bottom string) {
 		t.Fatal(err)
 	}
 
-	// pprofCgoTraceback is called whenever CGO code is executing and a signal
-	// is received. Disable signal preemption to increase the likelihood at
-	// least one SIGPROF signal fired to capture a sample. See issue #37201.
 	cmd := testenv.CleanCmdEnv(exec.Command(exe, runArg))
-	cmd.Env = append(cmd.Env, "GODEBUG=asyncpreemptoff=1")
-
 	got, err := cmd.CombinedOutput()
 	if err != nil {
 		if testenv.Builder() == "linux-amd64-alpine" {
@@ -526,13 +520,38 @@ func TestCgoTracebackSigpanic(t *testing.T) {
 	}
 	t.Parallel()
 	got := runTestProg(t, "testprogcgo", "TracebackSigpanic")
+	t.Log(got)
 	want := "runtime.sigpanic"
 	if !strings.Contains(got, want) {
-		t.Fatalf("want failure containing %q. output:\n%s\n", want, got)
+		t.Errorf("did not see %q in output", want)
 	}
-	nowant := "unexpected return pc"
+	// No runtime errors like "runtime: unexpected return pc".
+	nowant := "runtime: "
 	if strings.Contains(got, nowant) {
-		t.Fatalf("failure incorrectly contains %q. output:\n%s\n", nowant, got)
+		t.Errorf("unexpectedly saw %q in output", nowant)
+	}
+}
+
+func TestCgoPanicCallback(t *testing.T) {
+	t.Parallel()
+	got := runTestProg(t, "testprogcgo", "PanicCallback")
+	t.Log(got)
+	want := "panic: runtime error: invalid memory address or nil pointer dereference"
+	if !strings.Contains(got, want) {
+		t.Errorf("did not see %q in output", want)
+	}
+	want = "panic_callback"
+	if !strings.Contains(got, want) {
+		t.Errorf("did not see %q in output", want)
+	}
+	want = "PanicCallback"
+	if !strings.Contains(got, want) {
+		t.Errorf("did not see %q in output", want)
+	}
+	// No runtime errors like "runtime: unexpected return pc".
+	nowant := "runtime: "
+	if strings.Contains(got, nowant) {
+		t.Errorf("did not see %q in output", want)
 	}
 }
 
@@ -596,10 +615,46 @@ func TestSegv(t *testing.T) {
 			t.Parallel()
 			got := runTestProg(t, "testprogcgo", test)
 			t.Log(got)
-			if !strings.Contains(got, "SIGSEGV") {
-				t.Errorf("expected crash from signal")
+			want := "SIGSEGV"
+			if !strings.Contains(got, want) {
+				t.Errorf("did not see %q in output", want)
+			}
+
+			// No runtime errors like "runtime: unknown pc".
+			switch runtime.GOOS {
+			case "darwin", "illumos", "solaris":
+				// TODO(golang.org/issue/49182): Skip, runtime
+				// throws while attempting to generate
+				// traceback.
+			default:
+				nowant := "runtime: "
+				if strings.Contains(got, nowant) {
+					t.Errorf("unexpectedly saw %q in output", nowant)
+				}
 			}
 		})
+	}
+}
+
+func TestAbortInCgo(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9", "windows":
+		// N.B. On Windows, C abort() causes the program to exit
+		// without going through the runtime at all.
+		t.Skipf("no signals on %s", runtime.GOOS)
+	}
+
+	t.Parallel()
+	got := runTestProg(t, "testprogcgo", "Abort")
+	t.Log(got)
+	want := "SIGABRT"
+	if !strings.Contains(got, want) {
+		t.Errorf("did not see %q in output", want)
+	}
+	// No runtime errors like "runtime: unknown pc".
+	nowant := "runtime: "
+	if strings.Contains(got, nowant) {
+		t.Errorf("did not see %q in output", want)
 	}
 }
 
@@ -637,6 +692,14 @@ func TestNeedmDeadlock(t *testing.T) {
 		t.Skipf("no signals on %s", runtime.GOOS)
 	}
 	output := runTestProg(t, "testprogcgo", "NeedmDeadlock")
+	want := "OK\n"
+	if output != want {
+		t.Fatalf("want %s, got %s\n", want, output)
+	}
+}
+
+func TestCgoTracebackGoroutineProfile(t *testing.T) {
+	output := runTestProg(t, "testprogcgo", "GoroutineProfile")
 	want := "OK\n"
 	if output != want {
 		t.Fatalf("want %s, got %s\n", want, output)

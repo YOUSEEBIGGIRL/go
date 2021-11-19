@@ -980,17 +980,18 @@ func casgstatus(gp *g, oldval, newval uint32) {
 		gp.trackingSeq++
 	}
 	if gp.tracking {
-		now := nanotime()
 		if oldval == _Grunnable {
 			// We transitioned out of runnable, so measure how much
 			// time we spent in this state and add it to
 			// runnableTime.
+			now := nanotime()
 			gp.runnableTime += now - gp.runnableStamp
 			gp.runnableStamp = 0
 		}
 		if newval == _Grunnable {
 			// We just transitioned into runnable, so record what
 			// time that happened.
+			now := nanotime()
 			gp.runnableStamp = now
 		} else if newval == _Grunning {
 			// We're transitioning into running, so turn off
@@ -2232,6 +2233,9 @@ func newm1(mp *m) {
 		ts.fn = unsafe.Pointer(abi.FuncPCABI0(mstart))
 		if msanenabled {
 			msanwrite(unsafe.Pointer(&ts), unsafe.Sizeof(ts))
+		}
+		if asanenabled {
+			asanwrite(unsafe.Pointer(&ts), unsafe.Sizeof(ts))
 		}
 		execLock.rlock() // Prevent process clone.
 		asmcgocall(_cgo_thread_start, unsafe.Pointer(&ts))
@@ -3625,8 +3629,10 @@ func goexit1() {
 // goexit continuation on g0.
 func goexit0(gp *g) {
 	_g_ := getg()
+	_p_ := _g_.m.p.ptr()
 
 	casgstatus(gp, _Grunning, _Gdead)
+	gcController.addScannableStack(_p_, -int64(gp.stack.hi-gp.stack.lo))
 	if isSystemGoroutine(gp, false) {
 		atomic.Xadd(&sched.ngsys, -1)
 	}
@@ -3648,7 +3654,7 @@ func goexit0(gp *g) {
 		// Flush assist credit to the global pool. This gives
 		// better information to pacing if the application is
 		// rapidly creating an exiting goroutines.
-		assistWorkPerByte := float64frombits(atomic.Load64(&gcController.assistWorkPerByte))
+		assistWorkPerByte := gcController.assistWorkPerByte.Load()
 		scanCredit := int64(assistWorkPerByte * float64(gp.gcAssistBytes))
 		atomic.Xaddint64(&gcController.bgScanCredit, scanCredit)
 		gp.gcAssistBytes = 0
@@ -3657,7 +3663,7 @@ func goexit0(gp *g) {
 	dropg()
 
 	if GOARCH == "wasm" { // no threads yet on wasm
-		gfput(_g_.m.p.ptr(), gp)
+		gfput(_p_, gp)
 		schedule() // never returns
 	}
 
@@ -3665,7 +3671,7 @@ func goexit0(gp *g) {
 		print("invalid m->lockedInt = ", _g_.m.lockedInt, "\n")
 		throw("internal lockOSThread error")
 	}
-	gfput(_g_.m.p.ptr(), gp)
+	gfput(_p_, gp)
 	if locked {
 		// The goroutine may have locked this thread because
 		// it put it in an unusual kernel state. Kill it
@@ -4294,6 +4300,7 @@ func newproc1(fn *funcval, callergp *g, callerpc uintptr) *g {
 		newg.tracking = true
 	}
 	casgstatus(newg, _Gdead, _Grunnable)
+	gcController.addScannableStack(_p_, int64(newg.stack.hi-newg.stack.lo))
 
 	if _p_.goidcache == _p_.goidcacheend {
 		// Sched.goidgen is the last allocated id,
@@ -4433,6 +4440,9 @@ retry:
 		}
 		if msanenabled {
 			msanmalloc(unsafe.Pointer(gp.stack.lo), gp.stack.hi-gp.stack.lo)
+		}
+		if asanenabled {
+			asanunpoison(unsafe.Pointer(gp.stack.lo), gp.stack.hi-gp.stack.lo)
 		}
 	}
 	return gp
@@ -4647,6 +4657,7 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 	getg().m.mallocing++
 
 	var stk [maxCPUProfStack]uintptr
+	flags := uint(_TraceJumpStack)
 	n := 0
 	if mp.ncgo > 0 && mp.curg != nil && mp.curg.syscallpc != 0 && mp.curg.syscallsp != 0 {
 		cgoOff := 0
@@ -4664,12 +4675,12 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		}
 
 		// Collect Go stack that leads to the cgo call.
-		n = gentraceback(mp.curg.syscallpc, mp.curg.syscallsp, 0, mp.curg, 0, &stk[cgoOff], len(stk)-cgoOff, nil, nil, 0)
+		n = gentraceback(mp.curg.syscallpc, mp.curg.syscallsp, 0, mp.curg, 0, &stk[cgoOff], len(stk)-cgoOff, nil, nil, flags)
 		if n > 0 {
 			n += cgoOff
 		}
 	} else {
-		n = gentraceback(pc, sp, lr, gp, 0, &stk[0], len(stk), nil, nil, _TraceTrap|_TraceJumpStack)
+		n = gentraceback(pc, sp, lr, gp, 0, &stk[0], len(stk), nil, nil, _TraceTrap|flags)
 	}
 
 	if n <= 0 {
@@ -4679,10 +4690,10 @@ func sigprof(pc, sp, lr uintptr, gp *g, mp *m) {
 		if usesLibcall() && mp.libcallg != 0 && mp.libcallpc != 0 && mp.libcallsp != 0 {
 			// Libcall, i.e. runtime syscall on windows.
 			// Collect Go stack that leads to the call.
-			n = gentraceback(mp.libcallpc, mp.libcallsp, 0, mp.libcallg.ptr(), 0, &stk[0], len(stk), nil, nil, 0)
+			n = gentraceback(mp.libcallpc, mp.libcallsp, 0, mp.libcallg.ptr(), 0, &stk[0], len(stk), nil, nil, flags)
 		}
 		if n == 0 && mp != nil && mp.vdsoSP != 0 {
-			n = gentraceback(mp.vdsoPC, mp.vdsoSP, 0, gp, 0, &stk[0], len(stk), nil, nil, _TraceTrap|_TraceJumpStack)
+			n = gentraceback(mp.vdsoPC, mp.vdsoSP, 0, gp, 0, &stk[0], len(stk), nil, nil, flags)
 		}
 		if n == 0 {
 			// If all of the above has failed, account it against abstract "System" or "GC".
@@ -6125,7 +6136,7 @@ func (q *gQueue) pushBack(gp *g) {
 	q.tail.set(gp)
 }
 
-// pushBackAll adds all Gs in l2 to the tail of q. After this q2 must
+// pushBackAll adds all Gs in q2 to the tail of q. After this q2 must
 // not be used.
 func (q *gQueue) pushBackAll(q2 gQueue) {
 	if q2.tail == 0 {
