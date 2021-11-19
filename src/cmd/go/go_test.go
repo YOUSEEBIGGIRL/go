@@ -31,7 +31,6 @@ import (
 	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/robustio"
-	"cmd/go/internal/work"
 	"cmd/internal/sys"
 )
 
@@ -806,7 +805,9 @@ func TestNewReleaseRebuildsStalePackagesInGOPATH(t *testing.T) {
 		"src/internal/abi",
 		"src/internal/bytealg",
 		"src/internal/cpu",
+		"src/internal/goarch",
 		"src/internal/goexperiment",
+		"src/internal/goos",
 		"src/math/bits",
 		"src/unsafe",
 		filepath.Join("pkg", runtime.GOOS+"_"+runtime.GOARCH),
@@ -1376,10 +1377,10 @@ func TestLdFlagsLongArgumentsIssue42295(t *testing.T) {
 		}`)
 	testStr := "test test test test test \n\\ "
 	var buf bytes.Buffer
-	for buf.Len() < work.ArgLengthForResponseFile+1 {
+	for buf.Len() < sys.ExecArgLengthLimit+1 {
 		buf.WriteString(testStr)
 	}
-	tg.run("run", "-ldflags", fmt.Sprintf(`-X "main.extern=%s"`, buf.String()), tg.path("main.go"))
+	tg.run("run", "-buildinfo=false", "-ldflags", fmt.Sprintf(`-X "main.extern=%s"`, buf.String()), tg.path("main.go"))
 	if tg.stderr.String() != buf.String() {
 		t.Errorf("strings differ")
 	}
@@ -2847,4 +2848,36 @@ func TestExecInDeletedDir(t *testing.T) {
 
 	// `go version` should not fail
 	tg.run("version")
+}
+
+// A missing C compiler should not force the net package to be stale.
+// Issue 47215.
+func TestMissingCC(t *testing.T) {
+	if !canCgo {
+		t.Skip("test is only meaningful on systems with cgo")
+	}
+	cc := os.Getenv("CC")
+	if cc == "" {
+		cc = "gcc"
+	}
+	if filepath.IsAbs(cc) {
+		t.Skipf(`"CC" (%s) is an absolute path`, cc)
+	}
+	_, err := exec.LookPath(cc)
+	if err != nil {
+		t.Skipf(`"CC" (%s) not on PATH`, cc)
+	}
+
+	tg := testgo(t)
+	defer tg.cleanup()
+	netStale, _ := tg.isStale("net")
+	if netStale {
+		t.Skip(`skipping test because "net" package is currently stale`)
+	}
+
+	tg.setenv("PATH", "") // No C compiler on PATH.
+	netStale, _ = tg.isStale("net")
+	if netStale {
+		t.Error(`clearing "PATH" causes "net" to be stale`)
+	}
 }

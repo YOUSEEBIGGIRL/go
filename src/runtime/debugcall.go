@@ -78,7 +78,7 @@ func debugCallCheck(pc uintptr) string {
 		}
 
 		// Check that this isn't an unsafe-point.
-		if pc != f.entry {
+		if pc != f.entry() {
 			pc--
 		}
 		up := pcdatavalue(f, _PCDATA_UnsafePoint, pc, nil)
@@ -112,7 +112,7 @@ func debugCallWrap(dispatch uintptr) {
 		// closure and start the goroutine with that closure, but the compiler disallows
 		// implicit closure allocation in the runtime.
 		fn := debugCallWrap1
-		newg := newproc1(*(**funcval)(unsafe.Pointer(&fn)), nil, 0, gp, callerpc)
+		newg := newproc1(*(**funcval)(unsafe.Pointer(&fn)), gp, callerpc)
 		args := &debugCallWrapArgs{
 			dispatch: dispatch,
 			callingG: gp,

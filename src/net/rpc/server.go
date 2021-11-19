@@ -243,6 +243,10 @@ func (server *Server) RegisterName(name string, rcvr interface{}) error {
 	return server.register(rcvr, name, true)
 }
 
+// logRegisterError specifies whether to log problems during method registration.
+// To debug registration, recompile the package with this set to true.
+const logRegisterError = false
+
 func (server *Server) register(rcvr interface{}, name string, useName bool) error {
 	s := new(service)
 	s.typ = reflect.TypeOf(rcvr)
@@ -273,7 +277,7 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 	//    ReplyType reflect.Type
 	//    numCalls  uint
 	// }
-	s.method = suitableMethods(s.typ, true)
+	s.method = suitableMethods(s.typ, logRegisterError)
 
 	// 如果该结构体没有方法
 	if len(s.method) == 0 {
@@ -308,7 +312,7 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 // suitableMethods returns suitable Rpc methods of typ, it will report
 // error using log if reportErr is true.
 // map 的 key 是方法名，value 是 methodType，里面保存了该方法的一些信息
-func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
+func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 	methods := make(map[string]*methodType)
 	// 遍历获取 typ 下的所有方法
 	for m := 0; m < typ.NumMethod(); m++ {
@@ -324,7 +328,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		// Method needs three ins: receiver, *args, *reply.
 		// 确认方法是否拥有三个参数，三个参数如上所示，分别是 receiver, *args, *reply
 		if mtype.NumIn() != 3 {
-			if reportErr {
+			if logErr {
 				log.Printf("rpc.Register: method %q has %d input parameters; needs exactly three\n", mname, mtype.NumIn())
 			}
 			continue
@@ -334,7 +338,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		argType := mtype.In(1)
 		// 如果该参数不可导出，或者不是基本类型
 		if !isExportedOrBuiltinType(argType) {
-			if reportErr {
+			if logErr {
 				log.Printf("rpc.Register: argument type of method %q is not exported: %q\n", mname, argType)
 			}
 			continue
@@ -343,7 +347,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		// 第二个参数是调用方法的参数，必须是指针类型
 		replyType := mtype.In(2)
 		if replyType.Kind() != reflect.Ptr {
-			if reportErr {
+			if logErr {
 				log.Printf("rpc.Register: reply type of method %q is not a pointer: %q\n", mname, replyType)
 			}
 			continue
@@ -351,7 +355,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		// Reply type must be exported.
 		// 第三个参数是用来保存调用结果的，必须可导出
 		if !isExportedOrBuiltinType(replyType) {
-			if reportErr {
+			if logErr {
 				log.Printf("rpc.Register: reply type of method %q is not exported: %q\n", mname, replyType)
 			}
 			continue
@@ -359,7 +363,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		// Method needs one out.
 		// 方法需要有一个返回值
 		if mtype.NumOut() != 1 {
-			if reportErr {
+			if logErr {
 				log.Printf("rpc.Register: method %q has %d output parameters; needs exactly one\n", mname, mtype.NumOut())
 			}
 			continue
@@ -367,7 +371,7 @@ func suitableMethods(typ reflect.Type, reportErr bool) map[string]*methodType {
 		// The return type of the method must be error.
 		// 并且这个返回值必须是 error 类型
 		if returnType := mtype.Out(0); returnType != typeOfError {
-			if reportErr {
+			if logErr {
 				log.Printf("rpc.Register: return type of method %q is %q, must be error\n", mname, returnType)
 			}
 			continue

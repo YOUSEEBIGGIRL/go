@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"internal/abi"
 	"internal/profile"
 	"internal/testenv"
 	"os"
@@ -97,11 +98,11 @@ func testPCs(t *testing.T) (addr1, addr2 uint64, map1, map2 *profile.Mapping) {
 		map2 = mprof.Mapping[1]
 		map2.BuildID, _ = elfBuildID(map2.File)
 	case "js":
-		addr1 = uint64(funcPC(f1))
-		addr2 = uint64(funcPC(f2))
+		addr1 = uint64(abi.FuncPCABIInternal(f1))
+		addr2 = uint64(abi.FuncPCABIInternal(f2))
 	default:
-		addr1 = uint64(funcPC(f1))
-		addr2 = uint64(funcPC(f2))
+		addr1 = uint64(abi.FuncPCABIInternal(f1))
+		addr2 = uint64(abi.FuncPCABIInternal(f2))
 		// Fake mapping - HasFunctions will be true because two PCs from Go
 		// will be fully symbolized.
 		fake := &profile.Mapping{ID: 1, HasFunctions: true}
@@ -273,11 +274,10 @@ func TestProcSelfMaps(t *testing.T) {
 
 	f := func(t *testing.T, input string) {
 		for tx, tt := range strings.Split(input, "\n\n") {
-			i := strings.Index(tt, "->\n")
-			if i < 0 {
+			in, out, ok := strings.Cut(tt, "->\n")
+			if !ok {
 				t.Fatal("malformed test case")
 			}
-			in, out := tt[:i], tt[i+len("->\n"):]
 			if len(out) > 0 && out[len(out)-1] != '\n' {
 				out += "\n"
 			}
