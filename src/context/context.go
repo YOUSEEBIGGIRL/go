@@ -341,12 +341,17 @@ func init() {
 
 // A cancelCtx can be canceled. When canceled, it also cancels any children
 // that implement canceler.
+// 一个cancelCtx 可以被取消。取消时，它还会取消任何实现取消程序的子项。
 type cancelCtx struct {
 	Context	// 实现 Context 接口
 
 	mu       sync.Mutex            // protects following fields
+	// 保存的是一个 chan struct{}，惰性初始化，第一次调用 cancel 时会将其 close
+	// 惰性初始化：只有读取该值时（调用 Done 和 cancel），发现为空，才会进行初始化
+	// 该值用来判断此 context 是否已经被 close 了
 	done     atomic.Value          // of chan struct{}, created lazily, closed by first cancel call
 	children map[canceler]struct{} // set to nil by the first cancel call
+	// 如果被取消，则 err 不为空
 	err      error                 // set to non-nil by the first cancel call
 }
 
@@ -366,7 +371,7 @@ func (c *cancelCtx) Done() <-chan struct{} {
 	defer c.mu.Unlock()
 	d = c.done.Load()
 	if d == nil {
-		d = make(chan struct{})
+		d = make(chan struct{})	// 惰性初始化
 		c.done.Store(d)
 	}
 	return d.(chan struct{})
@@ -384,7 +389,7 @@ type stringer interface {
 }
 
 func contextName(c Context) string {
-	if s, ok := c.(stringer); ok {
+	if s, ok := c.(stringer); ok {	// 如果 c 实现了 stringer 接口
 		return s.String()
 	}
 	return reflectlite.TypeOf(c).String()
@@ -396,17 +401,23 @@ func (c *cancelCtx) String() string {
 
 // cancel closes c.done, cancels each of c's children, and, if
 // removeFromParent is true, removes c from its parent's children.
+// cancel 关闭 c.done，同时 cancel 掉 c 的每个 children，并且，如果 removeFromParent 为真，
+// 则从其 parent 的 children 中删除 c。
+// 必须要传递一个 err，用来告知为何被取消
 func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 	if err == nil {
 		panic("context: internal error: missing cancel error")
 	}
 	c.mu.Lock()
-	if c.err != nil {
+	if c.err != nil { // err 不为空，说明已经被取消
 		c.mu.Unlock()
 		return // already canceled
 	}
-	c.err = err
+
+	c.err = err // 设置 err
 	d, _ := c.done.Load().(chan struct{})
+	// 如果 d 为空，则将其设置为一个 closedchan，这是一个使用 make 初始化了的 chan
+	// TODO 为什么名字叫 closedchan？
 	if d == nil {
 		c.done.Store(closedchan)
 	} else {
