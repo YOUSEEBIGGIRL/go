@@ -155,7 +155,7 @@ var typeOfError = reflect.TypeOf((*error)(nil)).Elem()
 // type P struct { X, Y int64 }
 // type R struct {Res int64}
 // func (a *A) add(arg *P, reply *R) error { R.Res = P.X + P.Y }
-// 其中 arg 用来传递参数，reply用来保存结果
+// 其中 arg 用来传递参数，reply 用来保存结果
 // ArgType 保存参数的类型，比如在上面的例子中，ArgType 是 *P
 // ReplyType 同理
 type methodType struct {
@@ -214,6 +214,7 @@ func NewServer() *Server {
 var DefaultServer = NewServer()
 
 // Is this type exported or a builtin?
+// isExportedOrBuiltinType 检测 t 是否是可导出类型
 func isExportedOrBuiltinType(t reflect.Type) bool {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -247,13 +248,14 @@ func (server *Server) RegisterName(name string, rcvr interface{}) error {
 // To debug registration, recompile the package with this set to true.
 const logRegisterError = false
 
+// register 注册 rcvr 下的所有方法
 func (server *Server) register(rcvr interface{}, name string, useName bool) error {
 	s := new(service)
 	s.typ = reflect.TypeOf(rcvr)
 	s.rcvr = reflect.ValueOf(rcvr)
 	// 结构体的名字
 	sname := reflect.Indirect(s.rcvr).Type().Name()
-	if useName {
+	if useName { // 如果用户自定义了服务名，则使用自定义的
 		sname = name
 	}
 	if sname == "" {
@@ -311,7 +313,9 @@ func (server *Server) register(rcvr interface{}, name string, useName bool) erro
 
 // suitableMethods returns suitable Rpc methods of typ, it will report
 // error using log if reportErr is true.
-// map 的 key 是方法名，value 是 methodType，里面保存了该方法的一些信息
+// suitableMethods 返回 typ 下的合法（符合规定要求）的方法，如果传入的 logErr 为 true，
+// 则会打印日志，返回的是一个 map，map 的 key 是方法名，value 是 methodType，里面保存了
+// 该方法的一些信息
 func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 	methods := make(map[string]*methodType)
 	// 遍历获取 typ 下的所有方法
@@ -326,7 +330,7 @@ func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 		// ------------------ 下面是对方法规范性的检查 ------------------
 
 		// Method needs three ins: receiver, *args, *reply.
-		// 确认方法是否拥有三个参数，三个参数如上所示，分别是 receiver, *args, *reply
+		// 确认方法是否拥有三个参数，三个参数如上所示，分别是 receiver（接收者）, *args, *reply
 		if mtype.NumIn() != 3 {
 			if logErr {
 				log.Printf("rpc.Register: method %q has %d input parameters; needs exactly three\n", mname, mtype.NumIn())
@@ -334,9 +338,9 @@ func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 			continue
 		}
 		// First arg need not be a pointer.
-		// 第一个参数是 "对象.方法"，这是一个字符串类型，要求不能传入指针
+		// 第一个参数是 request（实际是第二个，第一个参数是函数接收者）
 		argType := mtype.In(1)
-		// 如果该参数不可导出，或者不是基本类型
+		// 如果该参数不可导出
 		if !isExportedOrBuiltinType(argType) {
 			if logErr {
 				log.Printf("rpc.Register: argument type of method %q is not exported: %q\n", mname, argType)
@@ -344,7 +348,7 @@ func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 			continue
 		}
 		// Second arg must be a pointer.
-		// 第二个参数是调用方法的参数，必须是指针类型
+		// 第二个参数是 response，必须是指针类型
 		replyType := mtype.In(2)
 		if replyType.Kind() != reflect.Pointer {
 			if logErr {
@@ -353,7 +357,7 @@ func suitableMethods(typ reflect.Type, logErr bool) map[string]*methodType {
 			continue
 		}
 		// Reply type must be exported.
-		// 第三个参数是用来保存调用结果的，必须可导出
+		// 第二个参数必须可导出
 		if !isExportedOrBuiltinType(replyType) {
 			if logErr {
 				log.Printf("rpc.Register: reply type of method %q is not exported: %q\n", mname, replyType)
@@ -521,7 +525,9 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 func (server *Server) ServeCodec(codec ServerCodec) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
+	log.Println("server codec")
 	for {
+		log.Println("for")
 		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
 		if err != nil {
 			if debugLog && err != io.EOF {
@@ -535,6 +541,7 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 				server.sendResponse(sending, req, invalidRequest, codec, err.Error())
 				server.freeRequest(req)
 			}
+			log.Println(err)
 			continue
 		}
 		wg.Add(1)

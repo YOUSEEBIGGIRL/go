@@ -2,7 +2,7 @@ package mytest
 
 import (
 	"log"
-	"net/http"
+	"net"
 	"net/rpc"
 	"testing"
 )
@@ -24,14 +24,19 @@ func TestServer(t *testing.T) {
 	if err := rpc.Register(new(Cal)); err != nil {
 		log.Fatalln(err)
 	}
-	rpc.HandleHTTP()
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalln(err)
+	lis, err := net.Listen("tcp", ":9999")
+	if err != nil {
+		t.Fatal(err)
 	}
+	rpc.Accept(lis)
+	//rpc.HandleHTTP()
+	//if err := http.ListenAndServe(":8080", nil); err != nil {
+	//	log.Fatalln(err)
+	//}
 }
 
 func TestClient(t *testing.T) {
-	dial, err := rpc.DialHTTP("tcp", ":8080")
+	dial, err := rpc.Dial("tcp", ":9999")
 	if err != nil {
 		log.Fatalln(err)
 	}
@@ -52,7 +57,6 @@ func TestClient(t *testing.T) {
 	//	}
 	//}()
 	//time.Sleep(time.Second * 10)
-
 
 	if err := dial.Call("Cal.Add", cal, res); err != nil {
 		log.Println(err)
