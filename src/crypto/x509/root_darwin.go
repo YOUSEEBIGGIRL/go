@@ -13,6 +13,9 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 	certs := macOS.CFArrayCreateMutable()
 	defer macOS.ReleaseCFArray(certs)
 	leaf := macOS.SecCertificateCreateWithData(c.Raw)
+	if leaf == 0 {
+		return nil, errors.New("invalid leaf certificate")
+	}
 	macOS.CFArrayAppendValue(certs, leaf)
 	if opts.Intermediates != nil {
 		for _, lc := range opts.Intermediates.lazyCerts {
@@ -21,7 +24,9 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 				return nil, err
 			}
 			sc := macOS.SecCertificateCreateWithData(c.Raw)
-			macOS.CFArrayAppendValue(certs, sc)
+			if sc != 0 {
+				macOS.CFArrayAppendValue(certs, sc)
+			}
 		}
 	}
 
@@ -96,14 +101,11 @@ func (c *Certificate) systemVerify(opts *VerifyOptions) (chains [][]*Certificate
 
 // exportCertificate returns a *Certificate for a SecCertificateRef.
 func exportCertificate(cert macOS.CFRef) (*Certificate, error) {
-	data, err := macOS.SecItemExport(cert)
+	data, err := macOS.SecCertificateCopyData(cert)
 	if err != nil {
 		return nil, err
 	}
-	defer macOS.CFRelease(data)
-	der := macOS.CFDataToSlice(data)
-
-	return ParseCertificate(der)
+	return ParseCertificate(data)
 }
 
 func loadSystemRoots() (*CertPool, error) {

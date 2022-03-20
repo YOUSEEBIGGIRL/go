@@ -261,7 +261,7 @@ type Entry struct {
 // ClassUnknown.
 type Field struct {
 	Attr  Attr
-	Val   interface{}
+	Val   any
 	Class Class
 }
 
@@ -382,7 +382,7 @@ func (i Class) GoString() string {
 // the check that the value has the expected dynamic type, as in:
 //	v, ok := e.Val(AttrSibling).(int64)
 //
-func (e *Entry) Val(a Attr) interface{} {
+func (e *Entry) Val(a Attr) any {
 	if f := e.AttrField(a); f != nil {
 		return f.Val
 	}
@@ -501,7 +501,7 @@ func (b *buf) entry(cu *Entry, atab abbrevTable, ubase Offset, vers int) *Entry 
 			fmt = format(b.uint())
 			e.Field[i].Class = formToClass(fmt, a.field[i].attr, vers, b)
 		}
-		var val interface{}
+		var val any
 		switch fmt {
 		default:
 			b.error("unknown entry attr format 0x" + strconv.FormatInt(int64(fmt), 16))
@@ -1122,7 +1122,7 @@ func (d *Data) dwarf2Ranges(u *unit, base uint64, ranges int64, ret [][2]uint64)
 	return ret, nil
 }
 
-// dwarf5Ranges interpets a debug_rnglists sequence, see DWARFv5 section
+// dwarf5Ranges interprets a debug_rnglists sequence, see DWARFv5 section
 // 2.17.3 (page 53).
 func (d *Data) dwarf5Ranges(u *unit, cu *Entry, base uint64, ranges int64, ret [][2]uint64) ([][2]uint64, error) {
 	var addrBase int64

@@ -160,7 +160,12 @@ func ImportedBody(fn *ir.Func) {
 	IncrementalAddrtaken = false
 	defer func() {
 		if DirtyAddrtaken {
-			ComputeAddrtaken(fn.Inl.Body) // compute addrtaken marks once types are available
+			// We do ComputeAddrTaken on function instantiations, but not
+			// generic functions (since we may not yet know if x in &x[i]
+			// is an array or a slice).
+			if !fn.Type().HasTParam() {
+				ComputeAddrtaken(fn.Inl.Body) // compute addrtaken marks once types are available
+			}
 			DirtyAddrtaken = false
 		}
 		IncrementalAddrtaken = true
@@ -236,12 +241,6 @@ func tcClosure(clo *ir.ClosureExpr, top int) ir.Node {
 		base.FatalfAt(fn.Pos(), "underlying closure func already typechecked: %v", fn)
 	}
 
-	// Set current associated iota value, so iota can be used inside
-	// function in ConstSpec, see issue #22344
-	if x := getIotaValue(); x >= 0 {
-		fn.Iota = x
-	}
-
 	ir.NameClosure(clo, ir.CurFunc)
 	Func(fn)
 
@@ -296,20 +295,12 @@ func tcFunc(n *ir.Func) {
 		defer tracePrint("tcFunc", n)(nil)
 	}
 
-	n.Nname = AssignExpr(n.Nname).(*ir.Name)
-	t := n.Nname.Type()
-	if t == nil {
-		return
-	}
-	rcvr := t.Recv()
-	if rcvr != nil && n.Shortname != nil {
-		m := addmethod(n, n.Shortname, t, true, n.Pragma&ir.Nointerface != 0)
-		if m == nil {
-			return
+	if name := n.Nname; name.Typecheck() == 0 {
+		if name.Ntype != nil {
+			name.Ntype = typecheckNtype(name.Ntype)
+			name.SetType(name.Ntype.Type())
 		}
-
-		n.Nname.SetSym(ir.MethodSym(rcvr.Type, n.Shortname))
-		Declare(n.Nname, ir.PFUNC)
+		name.SetTypecheck(1)
 	}
 }
 
@@ -317,9 +308,6 @@ func tcFunc(n *ir.Func) {
 func tcCall(n *ir.CallExpr, top int) ir.Node {
 	Stmts(n.Init()) // imported rewritten f(g()) calls (#30907)
 	n.X = typecheck(n.X, ctxExpr|ctxType|ctxCallee)
-	if n.X.Diag() {
-		n.SetDiag(true)
-	}
 
 	l := n.X
 
@@ -369,9 +357,7 @@ func tcCall(n *ir.CallExpr, top int) ir.Node {
 	l = n.X
 	if l.Op() == ir.OTYPE {
 		if n.IsDDD {
-			if !l.Type().Broke() {
-				base.Errorf("invalid use of ... in type conversion to %v", l.Type())
-			}
+			base.Errorf("invalid use of ... in type conversion to %v", l.Type())
 			n.SetDiag(true)
 		}
 

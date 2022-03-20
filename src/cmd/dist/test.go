@@ -218,6 +218,15 @@ func (t *tester) run() {
 		}
 	}
 
+	if err := t.maybeLogMetadata(); err != nil {
+		t.failed = true
+		if t.keepGoing {
+			log.Printf("Failed logging metadata: %v", err)
+		} else {
+			fatalf("Failed logging metadata: %v", err)
+		}
+	}
+
 	for _, dt := range t.tests {
 		if !t.shouldRunTest(dt.name) {
 			t.partial = true
@@ -266,6 +275,22 @@ func (t *tester) shouldRunTest(name string) bool {
 		}
 	}
 	return false
+}
+
+func (t *tester) maybeLogMetadata() error {
+	if t.compileOnly {
+		// We need to run a subprocess to log metadata. Don't do that
+		// on compile-only runs.
+		return nil
+	}
+	t.out("Test execution environment.")
+	// Helper binary to print system metadata (CPU model, etc). This is a
+	// separate binary from dist so it need not build with the bootstrap
+	// toolchain.
+	//
+	// TODO(prattmic): If we split dist bootstrap and dist test then this
+	// could be simplified to directly use internal/sysinfo here.
+	return t.dirCmd(filepath.Join(goroot, "src/cmd/internal/metadata"), "go", []string{"run", "."}).Run()
 }
 
 // short returns a -short flag value to use with 'go test'
@@ -333,15 +358,10 @@ var (
 	benchMatches []string
 )
 
-func (t *tester) registerStdTest(pkg string, useG3 bool) {
+func (t *tester) registerStdTest(pkg string) {
 	heading := "Testing packages."
 	testPrefix := "go_test:"
 	gcflags := gogcflags
-	if useG3 {
-		heading = "Testing packages with -G=3."
-		testPrefix = "go_test_g3:"
-		gcflags += " -G=3"
-	}
 
 	testName := testPrefix + pkg
 	if t.runRx == nil || t.runRx.MatchString(testName) == t.runRxWant {
@@ -377,7 +397,9 @@ func (t *tester) registerStdTest(pkg string, useG3 bool) {
 				"-short=" + short(),
 				t.tags(),
 				t.timeout(timeoutSec),
-				"-gcflags=all=" + gcflags,
+			}
+			if gcflags != "" {
+				args = append(args, "-gcflags=all="+gcflags)
 			}
 			if t.race {
 				args = append(args, "-race")
@@ -442,10 +464,7 @@ func (t *tester) registerTests() {
 	if len(t.runNames) > 0 {
 		for _, name := range t.runNames {
 			if strings.HasPrefix(name, "go_test:") {
-				t.registerStdTest(strings.TrimPrefix(name, "go_test:"), false)
-			}
-			if strings.HasPrefix(name, "go_test_g3:") {
-				t.registerStdTest(strings.TrimPrefix(name, "go_test_g3:"), true)
+				t.registerStdTest(strings.TrimPrefix(name, "go_test:"))
 			}
 			if strings.HasPrefix(name, "go_test_bench:") {
 				t.registerRaceBenchTest(strings.TrimPrefix(name, "go_test_bench:"))
@@ -468,15 +487,8 @@ func (t *tester) registerTests() {
 			fatalf("Error running go list std cmd: %v:\n%s", err, cmd.Stderr)
 		}
 		pkgs := strings.Fields(string(all))
-		if false {
-			// Disable -G=3 option for standard tests for now, since
-			// they are flaky on the builder.
-			for _, pkg := range pkgs {
-				t.registerStdTest(pkg, true /* -G=3 flag */)
-			}
-		}
 		for _, pkg := range pkgs {
-			t.registerStdTest(pkg, false)
+			t.registerStdTest(pkg)
 		}
 		if t.race {
 			for _, pkg := range pkgs {
@@ -1043,10 +1055,8 @@ func (t *tester) supportedBuildmode(mode string) bool {
 		}
 		return false
 	case "plugin":
-		// linux-arm64 is missing because it causes the external linker
-		// to crash, see https://golang.org/issue/17138
 		switch pair {
-		case "linux-386", "linux-amd64", "linux-arm", "linux-s390x", "linux-ppc64le":
+		case "linux-386", "linux-amd64", "linux-arm", "linux-arm64", "linux-s390x", "linux-ppc64le":
 			return true
 		case "darwin-amd64", "darwin-arm64":
 			return true
@@ -1119,9 +1129,9 @@ func (t *tester) cgoTest(dt *distTest) error {
 	cmd := t.addCmd(dt, "misc/cgo/test", t.goTest())
 	setEnv(cmd, "GOFLAGS", "-ldflags=-linkmode=auto")
 
-	// Skip internal linking cases on linux/arm64 to support GCC-9.4 and above.
+	// Skip internal linking cases on arm64 to support GCC-9.4 and above.
 	// See issue #39466.
-	skipInternalLink := goarch == "arm64" && goos == "linux"
+	skipInternalLink := goarch == "arm64" && goos != "darwin"
 
 	if t.internalLink() && !skipInternalLink {
 		cmd := t.addCmd(dt, "misc/cgo/test", t.goTest(), "-tags=internal")

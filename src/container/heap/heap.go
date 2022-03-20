@@ -33,10 +33,10 @@ type Interface interface {
 	sort.Interface
 
 	// Push 添加 x 到末尾
-	Push(x interface{}) // add x as element Len()
+	Push(x any) // add x as element Len()
 
 	// Pop 弹出末尾元素并返回
-	Pop() interface{}   // remove and return element Len() - 1.
+	Pop() any // remove and return element Len() - 1.
 }
 
 // Init establishes the heap invariants required by the other routines in this package.
@@ -55,7 +55,7 @@ func Init(h Interface) {
 
 // Push pushes the element x onto the heap.
 // The complexity is O(log n) where n = h.Len().
-func Push(h Interface, x interface{}) {
+func Push(h Interface, x any) {
 	h.Push(x)
 	// 从下到上堆化
 	up(h, h.Len()-1)
@@ -64,7 +64,7 @@ func Push(h Interface, x interface{}) {
 // Pop removes and returns the minimum element (according to Less) from the heap.
 // The complexity is O(log n) where n = h.Len().
 // Pop is equivalent to Remove(h, 0).
-func Pop(h Interface) interface{} {
+func Pop(h Interface) any {
 	n := h.Len() - 1
 	// 堆顶是最小（或最大）元素，将其交换到末尾，pop 会移除该元素
 	h.Swap(0, n)
@@ -76,7 +76,7 @@ func Pop(h Interface) interface{} {
 
 // Remove removes and returns the element at index i from the heap.
 // The complexity is O(log n) where n = h.Len().
-func Remove(h Interface, i int) interface{} {
+func Remove(h Interface, i int) any {
 	n := h.Len() - 1
 	if n != i {
 		h.Swap(i, n)
@@ -190,7 +190,7 @@ func up(h Interface, j int) {
 func down(h Interface, i0, n int) bool {
 	i := i0
 	for {
-		j1 := 2*i + 1          // j1 是 i 的左子节点
+		j1 := 2*i + 1 // j1 是 i 的左子节点
 		// j1 > n 代表子节点不存在
 		// j1 == n 代表子节点是堆中最后一个节点，down 操作会忽略最后一个元素
 		if j1 >= n || j1 < 0 { // j1 < 0 after int overflow

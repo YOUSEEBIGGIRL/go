@@ -2169,11 +2169,10 @@ func (ctxt *Link) buildinfo() {
 		return
 	}
 
+	// Write the buildinfo symbol, which go version looks for.
+	// The code reading this data is in package debug/buildinfo.
 	ldr := ctxt.loader
 	s := ldr.CreateSymForUpdate(".go.buildinfo", 0)
-	// On AIX, .go.buildinfo must be in the symbol table as
-	// it has relocations.
-	s.SetNotInSymbolTable(!ctxt.IsAIX())
 	s.SetType(sym.SBUILDINFO)
 	s.SetAlign(16)
 	// The \xff is invalid UTF-8, meant to make it less likely
@@ -2186,16 +2185,24 @@ func (ctxt *Link) buildinfo() {
 	if ctxt.Arch.ByteOrder == binary.BigEndian {
 		data[len(prefix)+1] = 1
 	}
+	data[len(prefix)+1] |= 2 // signals new pointer-free format
+	data = appendString(data, strdata["runtime.buildVersion"])
+	data = appendString(data, strdata["runtime.modinfo"])
+	// MacOS linker gets very upset if the size os not a multiple of alignment.
+	for len(data)%16 != 0 {
+		data = append(data, 0)
+	}
 	s.SetData(data)
 	s.SetSize(int64(len(data)))
-	r, _ := s.AddRel(objabi.R_ADDR)
-	r.SetOff(16)
-	r.SetSiz(uint8(ctxt.Arch.PtrSize))
-	r.SetSym(ldr.LookupOrCreateSym("runtime.buildVersion", 0))
-	r, _ = s.AddRel(objabi.R_ADDR)
-	r.SetOff(16 + int32(ctxt.Arch.PtrSize))
-	r.SetSiz(uint8(ctxt.Arch.PtrSize))
-	r.SetSym(ldr.LookupOrCreateSym("runtime.modinfo", 0))
+}
+
+// appendString appends s to data, prefixed by its varint-encoded length.
+func appendString(data []byte, s string) []byte {
+	var v [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(v[:], uint64(len(s)))
+	data = append(data, v[:n]...)
+	data = append(data, s...)
+	return data
 }
 
 // assign addresses to text
@@ -2771,10 +2778,29 @@ func compressSyms(ctxt *Link, syms []loader.Sym) []byte {
 	}
 
 	var buf bytes.Buffer
-	buf.Write([]byte("ZLIB"))
-	var sizeBytes [8]byte
-	binary.BigEndian.PutUint64(sizeBytes[:], uint64(total))
-	buf.Write(sizeBytes[:])
+	if ctxt.IsELF {
+		switch ctxt.Arch.PtrSize {
+		case 8:
+			binary.Write(&buf, ctxt.Arch.ByteOrder, elf.Chdr64{
+				Type:      uint32(elf.COMPRESS_ZLIB),
+				Size:      uint64(total),
+				Addralign: uint64(ctxt.Arch.Alignment),
+			})
+		case 4:
+			binary.Write(&buf, ctxt.Arch.ByteOrder, elf.Chdr32{
+				Type:      uint32(elf.COMPRESS_ZLIB),
+				Size:      uint32(total),
+				Addralign: uint32(ctxt.Arch.Alignment),
+			})
+		default:
+			log.Fatalf("can't compress header size:%d", ctxt.Arch.PtrSize)
+		}
+	} else {
+		buf.Write([]byte("ZLIB"))
+		var sizeBytes [8]byte
+		binary.BigEndian.PutUint64(sizeBytes[:], uint64(total))
+		buf.Write(sizeBytes[:])
+	}
 
 	var relocbuf []byte // temporary buffer for applying relocations
 

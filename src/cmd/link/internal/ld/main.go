@@ -119,12 +119,16 @@ func Main(arch *sys.Arch, theArch Arch) {
 		}
 	}
 
-	final := gorootFinal()
-	addstrdata1(ctxt, "runtime.defaultGOROOT="+final)
-	addstrdata1(ctxt, "internal/buildcfg.defaultGOROOT="+final)
+	if final := gorootFinal(); final == "$GOROOT" {
+		// cmd/go sets GOROOT_FINAL to the dummy value "$GOROOT" when -trimpath is set,
+		// but runtime.GOROOT() should return the empty string, not a bogus value.
+		// (See https://go.dev/issue/51461.)
+	} else {
+		addstrdata1(ctxt, "runtime.defaultGOROOT="+final)
+	}
 
 	buildVersion := buildcfg.Version
-	if goexperiment := buildcfg.GOEXPERIMENT(); goexperiment != "" {
+	if goexperiment := buildcfg.Experiment.String(); goexperiment != "" {
 		buildVersion += " X:" + goexperiment
 	}
 	addstrdata1(ctxt, "runtime.buildVersion="+buildVersion)
@@ -170,6 +174,10 @@ func Main(arch *sys.Arch, theArch Arch) {
 	if !*flagAslr && ctxt.BuildMode != BuildModeCShared {
 		Errorf(nil, "-aslr=false is only allowed for -buildmode=c-shared")
 		usage()
+	}
+
+	if *FlagD && ctxt.UsesLibc() {
+		Exitf("dynamic linking required on %s; -d flag cannot be used", buildcfg.GOOS)
 	}
 
 	checkStrictDups = *FlagStrictDups

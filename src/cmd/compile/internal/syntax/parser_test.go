@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"internal/testenv"
 	"io/ioutil"
 	"path/filepath"
 	"regexp"
@@ -46,7 +47,7 @@ func TestParseGo2(t *testing.T) {
 	for _, fi := range list {
 		name := fi.Name()
 		if !fi.IsDir() && !strings.HasPrefix(name, ".") {
-			ParseFile(filepath.Join(dir, name), func(err error) { t.Error(err) }, nil, AllowGenerics)
+			ParseFile(filepath.Join(dir, name), func(err error) { t.Error(err) }, nil, AllowGenerics|AllowMethodTypeParams)
 		}
 	}
 }
@@ -74,11 +75,14 @@ func TestStdLib(t *testing.T) {
 		lines    uint
 	}
 
+	goroot := testenv.GOROOT(t)
+
 	results := make(chan parseResult)
 	go func() {
 		defer close(results)
 		for _, dir := range []string{
-			runtime.GOROOT(),
+			filepath.Join(goroot, "src"),
+			filepath.Join(goroot, "misc"),
 		} {
 			walkDirs(t, dir, func(filename string) {
 				if skipRx != nil && skipRx.MatchString(filename) {

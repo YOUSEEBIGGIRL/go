@@ -120,6 +120,9 @@ func (f *File) stringTable(link uint32) ([]byte, error) {
 // Even if the section is stored compressed in the ELF file,
 // the ReadSeeker reads uncompressed data.
 func (s *Section) Open() io.ReadSeeker {
+	if s.Type == SHT_NOBITS {
+		return io.NewSectionReader(&zeroReader{}, 0, int64(s.Size))
+	}
 	if s.Flags&SHF_COMPRESSED == 0 {
 		return io.NewSectionReader(s.sr, 0, 1<<63-1)
 	}
@@ -185,7 +188,7 @@ type Symbol struct {
 type FormatError struct {
 	off int64
 	msg string
-	val interface{}
+	val any
 }
 
 func (e *FormatError) Error() string {
@@ -1147,11 +1150,37 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 		if err != nil && uint64(len(b)) < s.Size {
 			return nil, err
 		}
-
+		var (
+			dlen uint64
+			dbuf []byte
+		)
 		if len(b) >= 12 && string(b[:4]) == "ZLIB" {
-			dlen := binary.BigEndian.Uint64(b[4:12])
-			dbuf := make([]byte, dlen)
-			r, err := zlib.NewReader(bytes.NewBuffer(b[12:]))
+			dlen = binary.BigEndian.Uint64(b[4:12])
+			s.compressionOffset = 12
+		}
+		if dlen == 0 && len(b) >= 12 && s.Flags&SHF_COMPRESSED != 0 &&
+			s.Flags&SHF_ALLOC == 0 &&
+			f.FileHeader.ByteOrder.Uint32(b[:]) == uint32(COMPRESS_ZLIB) {
+			s.compressionType = COMPRESS_ZLIB
+			switch f.FileHeader.Class {
+			case ELFCLASS32:
+				// Chdr32.Size offset
+				dlen = uint64(f.FileHeader.ByteOrder.Uint32(b[4:]))
+				s.compressionOffset = 12
+			case ELFCLASS64:
+				if len(b) < 24 {
+					return nil, errors.New("invalid compress header 64")
+				}
+				// Chdr64.Size offset
+				dlen = f.FileHeader.ByteOrder.Uint64(b[8:])
+				s.compressionOffset = 24
+			default:
+				return nil, fmt.Errorf("unsupported compress header:%s", f.FileHeader.Class)
+			}
+		}
+		if dlen > 0 {
+			dbuf = make([]byte, dlen)
+			r, err := zlib.NewReader(bytes.NewBuffer(b[s.compressionOffset:]))
 			if err != nil {
 				return nil, err
 			}
@@ -1452,4 +1481,13 @@ func (f *File) DynString(tag DynTag) ([]string, error) {
 		}
 	}
 	return all, nil
+}
+
+type zeroReader struct{}
+
+func (*zeroReader) ReadAt(p []byte, off int64) (n int, err error) {
+	for i := range p {
+		p[i] = 0
+	}
+	return len(p), nil
 }

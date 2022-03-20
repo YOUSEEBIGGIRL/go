@@ -354,15 +354,18 @@ func (r *importReader) doDecl(sym *types.Sym) *ir.Name {
 		// declaration before recursing.
 		n := importtype(pos, sym)
 		t := n.Type()
+
+		// Because of recursion, we need to defer width calculations and
+		// instantiations on intermediate types until the top-level type is
+		// fully constructed. Note that we can have recursion via type
+		// constraints.
+		types.DeferCheckSize()
+		deferDoInst()
 		if tag == 'U' {
 			rparams := r.typeList()
 			t.SetRParams(rparams)
 		}
 
-		// We also need to defer width calculations until
-		// after the underlying type has been assigned.
-		types.DeferCheckSize()
-		deferDoInst()
 		underlying := r.typ()
 		t.SetUnderlying(underlying)
 
@@ -1371,7 +1374,9 @@ func (r *importReader) node() ir.Node {
 	case ir.OCLOSURE:
 		//println("Importing CLOSURE")
 		pos := r.pos()
+		r.setPkg()
 		typ := r.signature(nil, nil)
+		r.setPkg()
 
 		// All the remaining code below is similar to (*noder).funcLit(), but
 		// with Dcls and ClosureVars lists already set up
@@ -1630,11 +1635,16 @@ func (r *importReader) node() ir.Node {
 		return n
 
 	case ir.OADDR, ir.OPTRLIT:
-		n := NodAddrAt(r.pos(), r.expr())
 		if go117ExportTypes {
+			pos := r.pos()
+			expr := r.expr()
+			expr.SetTypecheck(1) // we do this for all nodes after importing, but do it now so markAddrOf can see it.
+			n := NodAddrAt(pos, expr)
 			n.SetOp(op)
 			n.SetType(r.typ())
+			return n
 		}
+		n := NodAddrAt(r.pos(), r.expr())
 		return n
 
 	case ir.ODEREF:

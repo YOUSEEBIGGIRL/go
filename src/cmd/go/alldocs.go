@@ -135,11 +135,6 @@
 //
 // 	-asmflags '[pattern=]arg list'
 // 		arguments to pass on each go tool asm invocation.
-// 	-buildinfo
-// 		Whether to stamp binaries with build flags. By default, the compiler name
-// 		(gc or gccgo), toolchain flags (like -gcflags), and environment variables
-// 		containing flags (like CGO_CFLAGS) are stamped into binaries. Use
-// 		-buildinfo=false to omit build information. See also -buildvcs.
 // 	-buildmode mode
 // 		build mode to use. See 'go help buildmode' for more.
 // 	-buildvcs
@@ -147,7 +142,7 @@
 // 		version control information is stamped into a binary if the main package
 // 		and the main module containing it are in the repository containing the
 // 		current directory (if there is a repository). Use -buildvcs=false to
-// 		omit version control information. See also -buildinfo.
+// 		omit version control information.
 // 	-compiler name
 // 		name of compiler to use, as in runtime.Compiler (gccgo or gc).
 // 	-gccgoflags '[pattern=]arg list'
@@ -182,14 +177,6 @@
 // 		directory, but it is not accessed. When -modfile is specified, an
 // 		alternate go.sum file is also used: its path is derived from the
 // 		-modfile flag by trimming the ".mod" extension and appending ".sum".
-// 	-workfile file
-// 		in module aware mode, use the given go.work file as a workspace file.
-// 		By default or when -workfile is "auto", the go command searches for a
-// 		file named go.work in the current directory and then containing directories
-// 		until one is found. If a valid go.work file is found, the modules
-// 		specified will collectively be used as the main modules. If -workfile
-// 		is "off", or a go.work file is not found in "auto" mode, workspace
-// 		mode is disabled.
 // 	-overlay file
 // 		read a JSON config file that provides an overlay for build operations.
 // 		The file is a JSON struct with a single field, named 'Replace', that
@@ -214,9 +201,8 @@
 // 	-trimpath
 // 		remove all file system paths from the resulting executable.
 // 		Instead of absolute file system paths, the recorded file names
-// 		will begin with either "go" (for the standard library),
-// 		or a module path@version (when using modules),
-// 		or a plain import path (when using GOPATH).
+// 		will begin either a module path@version (when using modules),
+// 		or a plain import path (when using the standard library, or GOPATH).
 // 	-toolexec 'cmd args'
 // 		a program to use to invoke toolchain programs like vet and asm.
 // 		For example, instead of running asm, the go command will run
@@ -368,9 +354,8 @@
 // path. The go tool's usual package mechanism does not apply: package path
 // elements like . and ... are not implemented by go doc.
 //
-// When run with two arguments, the first must be a full package path (not just a
-// suffix), and the second is a symbol, or symbol with method or struct field.
-// This is similar to the syntax accepted by godoc:
+// When run with two arguments, the first is a package path (full path or suffix),
+// and the second is a symbol, or symbol with method or struct field:
 //
 // 	go doc <pkg> <sym>[.<methodOrField>]
 //
@@ -884,7 +869,10 @@
 // for the go/build package's Context type.
 //
 // The -json flag causes the package data to be printed in JSON format
-// instead of using the template format.
+// instead of using the template format. The JSON flag can optionally be
+// provided with a set of comma-separated required field names to be output.
+// If so, those required fields will always appear in JSON output, but
+// others may be omitted to save work in computing the JSON struct.
 //
 // The -compiled flag causes list to set CompiledGoFiles to the Go source
 // files presented to the compiler. Typically this means that it repeats
@@ -1371,13 +1359,61 @@
 //
 // Workspace maintenance
 //
-// Go workspace provides access to operations on worskpaces.
+// Work provides access to operations on workspaces.
 //
-// Note that support for workspaces is built into many other commands,
-// not just 'go work'.
+// Note that support for workspaces is built into many other commands, not
+// just 'go work'.
 //
-// See 'go help modules' for information about Go's module system of
-// which workspaces are a part.
+// See 'go help modules' for information about Go's module system of which
+// workspaces are a part.
+//
+// See https://go.dev/ref/mod#workspaces for an in-depth reference on
+// workspaces.
+//
+// See https://go.dev/doc/tutorial/workspaces for an introductory
+// tutorial on workspaces.
+//
+// A workspace is specified by a go.work file that specifies a set of
+// module directories with the "use" directive. These modules are used as
+// root modules by the go command for builds and related operations.  A
+// workspace that does not specify modules to be used cannot be used to do
+// builds from local modules.
+//
+// go.work files are line-oriented. Each line holds a single directive,
+// made up of a keyword followed by arguments. For example:
+//
+// 	go 1.18
+//
+// 	use ../foo/bar
+// 	use ./baz
+//
+// 	replace example.com/foo v1.2.3 => example.com/bar v1.4.5
+//
+// The leading keyword can be factored out of adjacent lines to create a block,
+// like in Go imports.
+//
+// 	use (
+// 	  ../foo/bar
+// 	  ./baz
+// 	)
+//
+// The use directive specifies a module to be included in the workspace's
+// set of main modules. The argument to the use directive is the directory
+// containing the module's go.mod file.
+//
+// The go directive specifies the version of Go the file was written at. It
+// is possible there may be future changes in the semantics of workspaces
+// that could be controlled by this version, but for now the version
+// specified has no effect.
+//
+// The replace directive has the same syntax as the replace directive in a
+// go.mod file and takes precedence over replaces in go.mod files.  It is
+// primarily intended to override conflicting replaces in different workspace
+// modules.
+//
+// To determine whether the go command is operating in workspace mode, use
+// the "go env GOWORK" command. This will specify the workspace file being
+// used.
 //
 // Usage:
 //
@@ -1398,10 +1434,10 @@
 //
 // 	go work edit [editing flags] [go.work]
 //
-// Editwork provides a command-line interface for editing go.work,
+// Edit provides a command-line interface for editing go.work,
 // for use primarily by tools or scripts. It only reads go.work;
 // it does not look up information about the modules involved.
-// If no file is specified, editwork looks for a go.work file in the current
+// If no file is specified, Edit looks for a go.work file in the current
 // directory and its parent directories
 //
 // The editing flags specify a sequence of editing operations.
@@ -1409,7 +1445,7 @@
 // The -fmt flag reformats the go.work file without making other changes.
 // This reformatting is also implied by any other modifications that use or
 // rewrite the go.mod file. The only time this flag is needed is if no other
-// flags are specified, as in 'go mod editwork -fmt'.
+// flags are specified, as in 'go work edit -fmt'.
 //
 // The -use=path and -dropuse=path flags
 // add and drop a use directive from the go.work file's set of module directories.
@@ -1437,19 +1473,14 @@
 // The -json flag prints the final go.work file in JSON format instead of
 // writing it back to go.mod. The JSON output corresponds to these Go types:
 //
-// 	type Module struct {
-// 		Path    string
-// 		Version string
-// 	}
-//
 // 	type GoWork struct {
-// 		Go        string
-// 		Directory []Directory
-// 		Replace   []Replace
+// 		Go      string
+// 		Use     []Use
+// 		Replace []Replace
 // 	}
 //
 // 	type Use struct {
-// 		Path       string
+// 		DiskPath   string
 // 		ModulePath string
 // 	}
 //
@@ -1458,9 +1489,13 @@
 // 		New Module
 // 	}
 //
-// See the workspaces design proposal at
-// https://go.googlesource.com/proposal/+/master/design/45713-workspace.md for
-// more information.
+// 	type Module struct {
+// 		Path    string
+// 		Version string
+// 	}
+//
+// See the workspaces reference at https://go.dev/ref/mod#workspaces
+// for more information.
 //
 //
 // Initialize workspace file
@@ -1469,36 +1504,67 @@
 //
 // 	go work init [moddirs]
 //
-// go mod initwork initializes and writes a new go.work file in the current
-// directory, in effect creating a new workspace at the current directory.
+// Init initializes and writes a new go.work file in the
+// current directory, in effect creating a new workspace at the current
+// directory.
 //
-// go mod initwork optionally accepts paths to the workspace modules as arguments.
-// If the argument is omitted, an empty workspace with no modules will be created.
+// go work init optionally accepts paths to the workspace modules as
+// arguments. If the argument is omitted, an empty workspace with no
+// modules will be created.
 //
-// See the workspaces design proposal at
-// https://go.googlesource.com/proposal/+/master/design/45713-workspace.md for
-// more information.
+// Each argument path is added to a use directive in the go.work file. The
+// current go version will also be listed in the go.work file.
+//
+// See the workspaces reference at https://go.dev/ref/mod#workspaces
+// for more information.
 //
 //
 // Sync workspace build list to modules
 //
 // Usage:
 //
-// 	go work sync [moddirs]
+// 	go work sync
 //
-// go work sync
+// Sync syncs the workspace's build list back to the
+// workspace's modules
+//
+// The workspace's build list is the set of versions of all the
+// (transitive) dependency modules used to do builds in the workspace. go
+// work sync generates that build list using the Minimal Version Selection
+// algorithm, and then syncs those versions back to each of modules
+// specified in the workspace (with use directives).
+//
+// The syncing is done by sequentially upgrading each of the dependency
+// modules specified in a workspace module to the version in the build list
+// if the dependency module's version is not already the same as the build
+// list's version. Note that Minimal Version Selection guarantees that the
+// build list's version of each module is always the same or higher than
+// that in each workspace module.
+//
+// See the workspaces reference at https://go.dev/ref/mod#workspaces
+// for more information.
 //
 //
 // Add modules to workspace file
 //
 // Usage:
 //
-// 	go work use [-r] [moddirs]
+// 	go work use [-r] moddirs
 //
-// Use provides a command-line interface for adding directories,
-// optionally recursively, to a go.work file.
+// Use provides a command-line interface for adding
+// directories, optionally recursively, to a go.work file.
 //
-// The -r flag searches recursively for modules in the argument directories.
+// A use directive will be added to the go.work file for each argument
+// directory listed on the command line go.work file, if it exists on disk,
+// or removed from the go.work file if it does not exist on disk.
+//
+// The -r flag searches recursively for modules in the argument
+// directories, and the use command operates as if each of the directories
+// were specified as arguments: namely, use directives will be added for
+// directories that exist, and removed for directories that do not exist.
+//
+// See the workspaces reference at https://go.dev/ref/mod#workspaces
+// for more information.
 //
 //
 // Compile and run Go program
@@ -1532,6 +1598,10 @@
 // for example 'go_js_wasm_exec a.out arguments...'. This allows execution of
 // cross-compiled programs when a simulator or other execution method is
 // available.
+//
+// By default, 'go run' compiles the binary without generating the information
+// used by debuggers, to reduce build time. To include debugger information in
+// the binary, use 'go build'.
 //
 // The exit status of Run is not the exit status of the compiled binary.
 //
@@ -1979,6 +2049,8 @@
 // 	GOENV
 // 		The location of the Go environment configuration file.
 // 		Cannot be set using 'go env -w'.
+// 		Setting GOENV=off in the environment disables the use of the
+// 		default configuration file.
 // 	GOFLAGS
 // 		A space-separated list of -flag=value settings to apply
 // 		to go commands by default, when the given flag is known by
@@ -2016,6 +2088,14 @@
 // 	GOVCS
 // 		Lists version control commands that may be used with matching servers.
 // 		See 'go help vcs'.
+// 	GOWORK
+// 		In module aware mode, use the given go.work file as a workspace file.
+// 		By default or when GOWORK is "auto", the go command searches for a
+// 		file named go.work in the current directory and then containing directories
+// 		until one is found. If a valid go.work file is found, the modules
+// 		specified will collectively be used as the main modules. If GOWORK
+// 		is "off", or a go.work file is not found in "auto" mode, workspace
+// 		mode is disabled.
 //
 // Environment variables for use with cgo:
 //
@@ -2068,7 +2148,7 @@
 // 	GOAMD64
 // 		For GOARCH=amd64, the microarchitecture level for which to compile.
 // 		Valid values are v1 (default), v2, v3, v4.
-// 		See https://en.wikipedia.org/wiki/X86-64#Microarchitecture_levels.
+// 		See https://golang.org/wiki/MinimumRequirements#amd64
 // 	GOMIPS
 // 		For GOARCH=mips{,le}, whether to use floating point instructions.
 // 		Valid values are hardfloat (default), softfloat.
@@ -2852,11 +2932,19 @@
 // 	    section of the testing package documentation for details.
 //
 // 	-fuzztime t
-// 	    Run enough iterations of the fuzz test to take t, specified as a
-// 	    time.Duration (for example, -fuzztime 1h30s). The default is to run
-// 	    forever.
-// 	    The special syntax Nx means to run the fuzz test N times
-// 	    (for example, -fuzztime 100x).
+// 	    Run enough iterations of the fuzz target during fuzzing to take t,
+// 	    specified as a time.Duration (for example, -fuzztime 1h30s).
+// 		The default is to run forever.
+// 	    The special syntax Nx means to run the fuzz target N times
+// 	    (for example, -fuzztime 1000x).
+//
+// 	-fuzzminimizetime t
+// 	    Run enough iterations of the fuzz target during each minimization
+// 	    attempt to take t, as specified as a time.Duration (for example,
+// 	    -fuzzminimizetime 30s).
+// 		The default is 60s.
+// 	    The special syntax Nx means to run the fuzz target N times
+// 	    (for example, -fuzzminimizetime 100x).
 //
 // 	-json
 // 	    Log verbose output and test results in JSON. This presents the

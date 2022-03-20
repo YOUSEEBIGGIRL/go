@@ -33,7 +33,7 @@ func isBasic(t Type, info BasicInfo) bool {
 // The allX predicates below report whether t is an X.
 // If t is a type parameter the result is true if isX is true
 // for all specified types of the type parameter's type set.
-// allX is an optimized version of isX(structuralType(t)) (which
+// allX is an optimized version of isX(coreType(t)) (which
 // is the same as underIs(t, isX)).
 
 func allBoolean(typ Type) bool         { return allBasic(typ, IsBoolean) }
@@ -47,7 +47,7 @@ func allNumericOrString(typ Type) bool { return allBasic(typ, IsNumeric|IsString
 // allBasic reports whether under(t) is a basic type with the specified info.
 // If t is a type parameter, the result is true if isBasic(t, info) is true
 // for all specific types of the type parameter's type set.
-// allBasic(t, info) is an optimized version of isBasic(structuralType(t), info).
+// allBasic(t, info) is an optimized version of isBasic(coreType(t), info).
 func allBasic(t Type, info BasicInfo) bool {
 	if tpar, _ := t.(*TypeParam); tpar != nil {
 		return tpar.is(func(t *term) bool { return t != nil && isBasic(t.typ, info) })
@@ -104,10 +104,12 @@ func isGeneric(t Type) bool {
 
 // Comparable reports whether values of type T are comparable.
 func Comparable(T Type) bool {
-	return comparable(T, nil)
+	return comparable(T, true, nil, nil)
 }
 
-func comparable(T Type, seen map[Type]bool) bool {
+// If dynamic is set, non-type parameter interfaces are always comparable.
+// If reportf != nil, it may be used to report why T is not comparable.
+func comparable(T Type, dynamic bool, seen map[Type]bool, reportf func(string, ...interface{})) bool {
 	if seen[T] {
 		return true
 	}
@@ -125,15 +127,24 @@ func comparable(T Type, seen map[Type]bool) bool {
 		return true
 	case *Struct:
 		for _, f := range t.fields {
-			if !comparable(f.typ, seen) {
+			if !comparable(f.typ, dynamic, seen, nil) {
+				if reportf != nil {
+					reportf("struct containing %s cannot be compared", f.typ)
+				}
 				return false
 			}
 		}
 		return true
 	case *Array:
-		return comparable(t.elem, seen)
+		if !comparable(t.elem, dynamic, seen, nil) {
+			if reportf != nil {
+				reportf("%s cannot be compared", t)
+			}
+			return false
+		}
+		return true
 	case *Interface:
-		return !isTypeParam(T) || t.IsComparable()
+		return dynamic && !isTypeParam(T) || t.typeSet().IsComparable(seen)
 	}
 	return false
 }
@@ -237,23 +248,63 @@ func identical(x, y Type, cmpTags bool, p *ifacePair) bool {
 		}
 
 	case *Signature:
-		// Two function types are identical if they have the same number of parameters
-		// and result values, corresponding parameter and result types are identical,
-		// and either both functions are variadic or neither is. Parameter and result
-		// names are not required to match.
-		// Generic functions must also have matching type parameter lists, but for the
-		// parameter names.
-		if y, ok := y.(*Signature); ok {
-			return x.variadic == y.variadic &&
-				identicalTParams(x.TypeParams().list(), y.TypeParams().list(), cmpTags, p) &&
-				identical(x.params, y.params, cmpTags, p) &&
-				identical(x.results, y.results, cmpTags, p)
+		y, _ := y.(*Signature)
+		if y == nil {
+			return false
 		}
+
+		// Two function types are identical if they have the same number of
+		// parameters and result values, corresponding parameter and result types
+		// are identical, and either both functions are variadic or neither is.
+		// Parameter and result names are not required to match, and type
+		// parameters are considered identical modulo renaming.
+
+		if x.TypeParams().Len() != y.TypeParams().Len() {
+			return false
+		}
+
+		// In the case of generic signatures, we will substitute in yparams and
+		// yresults.
+		yparams := y.params
+		yresults := y.results
+
+		if x.TypeParams().Len() > 0 {
+			// We must ignore type parameter names when comparing x and y. The
+			// easiest way to do this is to substitute x's type parameters for y's.
+			xtparams := x.TypeParams().list()
+			ytparams := y.TypeParams().list()
+
+			var targs []Type
+			for i := range xtparams {
+				targs = append(targs, x.TypeParams().At(i))
+			}
+			smap := makeSubstMap(ytparams, targs)
+
+			var check *Checker // ok to call subst on a nil *Checker
+
+			// Constraints must be pair-wise identical, after substitution.
+			for i, xtparam := range xtparams {
+				ybound := check.subst(token.NoPos, ytparams[i].bound, smap, nil)
+				if !identical(xtparam.bound, ybound, cmpTags, p) {
+					return false
+				}
+			}
+
+			yparams = check.subst(token.NoPos, y.params, smap, nil).(*Tuple)
+			yresults = check.subst(token.NoPos, y.results, smap, nil).(*Tuple)
+		}
+
+		return x.variadic == y.variadic &&
+			identical(x.params, yparams, cmpTags, p) &&
+			identical(x.results, yresults, cmpTags, p)
 
 	case *Union:
 		if y, _ := y.(*Union); y != nil {
-			xset := computeUnionTypeSet(nil, token.NoPos, x)
-			yset := computeUnionTypeSet(nil, token.NoPos, y)
+			// TODO(rfindley): can this be reached during type checking? If so,
+			// consider passing a type set map.
+			unionSets := make(map[*Union]*_TypeSet)
+			xset := computeUnionTypeSet(nil, unionSets, token.NoPos, x)
+			yset := computeUnionTypeSet(nil, unionSets, token.NoPos, y)
 			return xset.terms.equal(yset.terms)
 		}
 
@@ -268,6 +319,9 @@ func identical(x, y Type, cmpTags bool, p *ifacePair) bool {
 		if y, ok := y.(*Interface); ok {
 			xset := x.typeSet()
 			yset := y.typeSet()
+			if xset.comparable != yset.comparable {
+				return false
+			}
 			if !xset.terms.equal(yset.terms) {
 				return false
 			}
@@ -389,19 +443,6 @@ func identicalInstance(xorig Type, xargs []Type, yorig Type, yargs []Type) bool 
 	}
 
 	return Identical(xorig, yorig)
-}
-
-func identicalTParams(x, y []*TypeParam, cmpTags bool, p *ifacePair) bool {
-	if len(x) != len(y) {
-		return false
-	}
-	for i, x := range x {
-		y := y[i]
-		if !identical(x.bound, y.bound, cmpTags, p) {
-			return false
-		}
-	}
-	return true
 }
 
 // Default returns the default "typed" type for an "untyped" type;

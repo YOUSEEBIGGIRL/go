@@ -45,7 +45,7 @@ type Requirements struct {
 	pruning modPruning
 
 	// rootModules is the set of root modules of the graph, sorted and capped to
-	// length. It may contain duplicates, and may  contain multiple versions for a
+	// length. It may contain duplicates, and may contain multiple versions for a
 	// given module path. The root modules of the groph are the set of main
 	// modules in workspace mode, and the main module's direct requirements
 	// outside workspace mode.
@@ -326,7 +326,7 @@ func readModGraph(ctx context.Context, pruning modPruning, roots []module.Versio
 	// It does not load the transitive requirements of m even if the go version in
 	// m's go.mod file indicates that it supports graph pruning.
 	loadOne := func(m module.Version) (*modFileSummary, error) {
-		cached := mg.loadCache.Do(m, func() interface{} {
+		cached := mg.loadCache.Do(m, func() any {
 			summary, err := goModSummary(m)
 
 			mu.Lock()
@@ -352,7 +352,7 @@ func readModGraph(ctx context.Context, pruning modPruning, roots []module.Versio
 		if pruning == unpruned {
 			if _, dup := loadingUnpruned.LoadOrStore(m, nil); dup {
 				// m has already been enqueued for loading. Since unpruned loading may
-				// follow cycles in the the requirement graph, we need to return early
+				// follow cycles in the requirement graph, we need to return early
 				// to avoid making the load queue infinitely long.
 				return
 			}
@@ -385,6 +385,52 @@ func readModGraph(ctx context.Context, pruning modPruning, roots []module.Versio
 		enqueue(m, pruning)
 	}
 	<-loadQueue.Idle()
+
+	// Reload any dependencies of the main modules which are not
+	// at their selected versions at workspace mode, because the
+	// requirements don't accurately reflect the transitive imports.
+	if pruning == workspace {
+		// hasDepsInAll contains the set of modules that need to be loaded
+		// at workspace pruning because any of their dependencies may
+		// provide packages in all.
+		hasDepsInAll := make(map[string]bool)
+		seen := map[module.Version]bool{}
+		for _, m := range roots {
+			hasDepsInAll[m.Path] = true
+			seen[m] = true
+		}
+		// This loop will terminate because it will call enqueue on each version of
+		// each dependency of the modules in hasDepsInAll at most once (and only
+		// calls enqueue on successively increasing versions of each dependency).
+		for {
+			needsEnqueueing := map[module.Version]bool{}
+			for p := range hasDepsInAll {
+				m := module.Version{Path: p, Version: mg.g.Selected(p)}
+				reqs, ok := mg.g.RequiredBy(m)
+				if !ok {
+					needsEnqueueing[m] = true
+					continue
+				}
+				for _, r := range reqs {
+					s := module.Version{Path: r.Path, Version: mg.g.Selected(r.Path)}
+					if cmpVersion(s.Version, r.Version) > 0 && !seen[s] {
+						needsEnqueueing[s] = true
+					}
+				}
+			}
+			// add all needs enqueueing to paths we care about
+			if len(needsEnqueueing) == 0 {
+				break
+			}
+
+			for p := range needsEnqueueing {
+				enqueue(p, workspace)
+				seen[p] = true
+				hasDepsInAll[p.Path] = true
+			}
+			<-loadQueue.Idle()
+		}
+	}
 
 	if hasError {
 		return mg, mg.findError()
